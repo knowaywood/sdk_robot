@@ -43,7 +43,10 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
     Args:
         actions: List of action points
         factor: Interpolation multiplier (e.g. 2 means 2x points)
-        mode: "end_pose" (handles Euler angles with Slerp) or "joints" (all linear)
+        mode: "end_pose" (handles Euler angles with NLERP) or "joints"
+
+        The final gripper dimension uses zero-order hold in both modes so grasp and
+        release commands remain aligned with the original action keyframes.
 
     Returns:
         Interpolated list of actions
@@ -62,7 +65,7 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
     interpolated_actions = np.zeros((int(target_num_actions), action_dim))
 
     if mode == "end_pose":
-        # Linear interp for pos (0,1,2) and gripper (6)
+        # Linear interp for position (0,1,2).
         # Assuming format: [x, y, z, r, p, y, gripper]
         # If dims > 7, we might need to be careful, but assuming 7D for now as per EX001
 
@@ -70,12 +73,6 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
         for i in range(3):
             interpolated_actions[:, i] = np.interp(
                 target_indices, original_indices, actions_np[:, i]
-            )
-
-        # Interpolate gripper (last element)
-        if action_dim > 6:
-            interpolated_actions[:, -1] = np.interp(
-                target_indices, original_indices, actions_np[:, -1]
             )
 
         # NLERP for orientation (3,4,5) - Euler angles
@@ -101,11 +98,19 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
             ).as_euler("xyz", degrees=False)
 
     else:
-        # Linear interp for all joints + gripper
-        for i in range(action_dim):
+        # The last dimension is the gripper; only interpolate arm joints here.
+        for i in range(action_dim - 1):
             interpolated_actions[:, i] = np.interp(
                 target_indices, original_indices, actions_np[:, i]
             )
+
+    has_gripper = action_dim > 6 if mode == "end_pose" else action_dim > 0
+    if has_gripper:
+        # Hold the previous command until the next model keyframe. The actuator's
+        # own position controller handles the physical opening/closing trajectory.
+        gripper_indices = np.arange(int(target_num_actions)) // factor
+        gripper_indices = np.minimum(gripper_indices, num_actions - 1)
+        interpolated_actions[:, -1] = actions_np[gripper_indices, -1]
 
     return interpolated_actions.tolist()
 
