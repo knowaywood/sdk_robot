@@ -8,6 +8,29 @@ logger = logging.getLogger(__name__)
 _GRIPPER_ARM_KEYS = ["follow1_pos", "follow2_pos", "follow1_joints", "follow2_joints"]
 
 
+def decode_outputs(outputs: Dict) -> Dict:
+    """Convert msgpack-numpy encoded arrays back to real numpy arrays."""
+    decoded = {}
+    for key, val in outputs.items():
+        if isinstance(val, dict):
+            nd_key = b"__ndarray__" if b"__ndarray__" in val else \
+                     "__ndarray__" if "__ndarray__" in val else None
+            if nd_key is not None:
+                dtype_key = b"dtype" if b"dtype" in val else "dtype"
+                shape_key = b"shape" if b"shape" in val else "shape"
+                data_key = b"data" if b"data" in val else "data"
+                try:
+                    dtype = np.dtype(val[dtype_key])
+                    shape = val[shape_key]
+                    decoded[key] = np.frombuffer(val[data_key], dtype=dtype).reshape(shape)
+                except Exception as e:
+                    logger.warning(f"Failed to decode {key}: {e}")
+                    decoded[key] = val
+                continue
+        decoded[key] = val
+    return decoded
+
+
 def restore_gripper_in_outputs(
     blended: Dict[str, np.ndarray],
     raw: Dict[str, np.ndarray],
@@ -22,7 +45,7 @@ def restore_gripper_in_outputs(
             continue
         b = blended[key]
         r = raw[key]
-        if b is None or r is None:
+        if b is None or r is None or isinstance(b, dict) or isinstance(r, dict):
             continue
         b = np.asarray(b, dtype=np.float64)
         r = np.asarray(r, dtype=np.float64)
@@ -74,7 +97,9 @@ def smooth_chunk_boundary(
 
     for key in new_outputs:
         new_arr = new_outputs[key]
-        if new_arr is None:
+
+        # Skip values that aren't actual arrays (e.g., msgpack-numpy encoded)
+        if new_arr is None or isinstance(new_arr, dict):
             blended[key] = new_arr
             continue
 
@@ -83,12 +108,8 @@ def smooth_chunk_boundary(
             blended[key] = new_arr
             continue
 
-        if key not in prev_outputs:
-            blended[key] = new_arr
-            continue
-
-        prev_arr = prev_outputs[key]
-        if prev_arr is None:
+        prev_arr = prev_outputs.get(key)
+        if prev_arr is None or isinstance(prev_arr, dict):
             blended[key] = new_arr
             continue
 

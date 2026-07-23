@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import dns.resolver
 from x2robot_client.inference_client import RobotClient
 from x2robot_client.rtc_inference import (
+    decode_outputs,
     restore_gripper_in_outputs,
     smooth_chunk_boundary,
 )
@@ -135,13 +136,15 @@ class RobotClientBase(ABC):
                     outputs = self._inference_with_retry(sensor_data)
                     ed_time_2 = time.time()
 
-                    # 3. Smooth chunk boundary (if enabled)
-                    raw_outputs = outputs
+                    # 3. Decode msgpack-numpy arrays before any processing
+                    raw_decoded = decode_outputs(outputs)
                     if self.smooth_chunks:
                         outputs = smooth_chunk_boundary(
-                            self.prev_outputs, outputs, self.blend_steps
+                            self.prev_outputs, raw_decoded, self.blend_steps
                         )
-                        outputs = restore_gripper_in_outputs(outputs, raw_outputs)
+                        outputs = restore_gripper_in_outputs(outputs, raw_decoded)
+                    else:
+                        outputs = raw_decoded
                     self.prev_outputs = outputs
 
                     # 4. Execute actions
