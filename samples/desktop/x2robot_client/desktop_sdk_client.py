@@ -19,7 +19,11 @@ from x2robot.sdk import (
 )
 from x2robot.sensor_msgs import CompressedImage
 from x2robot_client.robot_client_base import RobotClientBase
-from x2robot_client.sdk_utils import compressed_image_to_numpy, interpolate_trajectory
+from x2robot_client.sdk_utils import (
+    compressed_image_to_numpy,
+    interpolate_trajectory,
+    restore_gripper_from_raw,
+)
 
 
 class SDKClientLogger:
@@ -333,12 +337,24 @@ class DesktopClient(RobotClientBase):
             if self.last_arm_r_pos is not None:
                 arm2_actions = [self.last_arm_r_pos] + arm2_actions
 
+        raw_arm1 = arm1_actions
+        raw_arm2 = arm2_actions
+
         arm1_actions = interpolate_trajectory(
             arm1_actions, self.interpolate_multiplier, self.control_mode
         )
         arm2_actions = interpolate_trajectory(
             arm2_actions, self.interpolate_multiplier, self.control_mode
         )
+
+        # Restore gripper from raw to avoid interpolation artifacts
+        if self.interpolate_multiplier > 1:
+            arm1_actions = restore_gripper_from_raw(
+                arm1_actions, raw_arm1, self.interpolate_multiplier
+            )
+            arm2_actions = restore_gripper_from_raw(
+                arm2_actions, raw_arm2, self.interpolate_multiplier
+            )
 
         if self.control_mode == "end_pose":
             logger.info(f"Executing end_pose actions: {len(arm1_actions)} steps")

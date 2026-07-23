@@ -1,9 +1,46 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_GRIPPER_ARM_KEYS = ["follow1_pos", "follow2_pos", "follow1_joints", "follow2_joints"]
+
+
+def restore_gripper_in_outputs(
+    blended: Dict[str, np.ndarray],
+    raw: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """
+    Restore the last dimension (gripper) of arm action arrays from raw
+    model outputs.  This prevents blending / smoothing artifacts on the
+    gripper channel, which should be binary (open ≈ 0, close ≈ 4.5).
+    """
+    for key in _GRIPPER_ARM_KEYS:
+        if key not in blended or key not in raw:
+            continue
+        b = blended[key]
+        r = raw[key]
+        if b is None or r is None:
+            continue
+        b = np.asarray(b, dtype=np.float64)
+        r = np.asarray(r, dtype=np.float64)
+        if b.ndim != 2 or r.ndim != 2 or b.shape[1] != r.shape[1]:
+            continue
+        if r.shape[0] == b.shape[0]:
+            b[:, -1] = r[:, -1]
+        else:
+            b[:, -1] = _nearest_gripper(r[:, -1], b.shape[0])
+    return blended
+
+
+def _nearest_gripper(raw_gripper: np.ndarray, target_len: int) -> np.ndarray:
+    """Expand gripper values by nearest-neighbour (hold-last repeat)."""
+    raw_len = len(raw_gripper)
+    indices = np.linspace(0, raw_len - 1, target_len).astype(np.intp)
+    np.clip(indices, 0, raw_len - 1, out=indices)
+    return raw_gripper[indices]
 
 
 def smooth_chunk_boundary(

@@ -5,7 +5,10 @@ from typing import Any, Dict, Optional
 
 import dns.resolver
 from x2robot_client.inference_client import RobotClient
-from x2robot_client.rtc_inference import smooth_chunk_boundary
+from x2robot_client.rtc_inference import (
+    restore_gripper_in_outputs,
+    smooth_chunk_boundary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,10 +136,12 @@ class RobotClientBase(ABC):
                     ed_time_2 = time.time()
 
                     # 3. Smooth chunk boundary (if enabled)
+                    raw_outputs = outputs
                     if self.smooth_chunks:
                         outputs = smooth_chunk_boundary(
                             self.prev_outputs, outputs, self.blend_steps
                         )
+                        outputs = restore_gripper_in_outputs(outputs, raw_outputs)
                     self.prev_outputs = outputs
 
                     # 4. Execute actions

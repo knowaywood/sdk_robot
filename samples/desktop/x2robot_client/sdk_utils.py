@@ -110,6 +110,25 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
     return interpolated_actions.tolist()
 
 
+def restore_gripper_from_raw(
+    interpolated: list, raw: list, factor: int
+) -> list:
+    """Override the last dim (gripper) of interpolated arm actions with
+    nearest-neighbour values from the raw (pre-interpolation) actions,
+    preventing linear interpolation artifacts on the binary gripper."""
+    if not interpolated or not raw or factor <= 1:
+        return interpolated
+    raw_arr = np.asarray(raw, dtype=np.float64)
+    out = np.asarray(interpolated, dtype=np.float64)
+    if raw_arr.ndim != 2 or out.ndim != 2 or raw_arr.shape[1] != out.shape[1]:
+        return interpolated
+    raw_len = raw_arr.shape[0]
+    idx = np.arange(out.shape[0]) // factor
+    np.clip(idx, 0, raw_len - 1, out=idx)
+    out[:, -1] = raw_arr[idx, -1]
+    return out.tolist()
+
+
 def smoothen(
     arr: np.ndarray, window: int = None, poly: int = 2, ema_alpha: float = 0.25
 ) -> np.ndarray:
