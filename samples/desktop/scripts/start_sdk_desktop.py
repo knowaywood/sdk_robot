@@ -116,10 +116,10 @@ def parse_args():
     parser.add_argument(
         "--inference-workers",
         type=int,
-        default=1,
+        default=2,
         choices=range(1, 5),
         metavar="{1,2,3,4}",
-        help="Number of model connections; 1 avoids server-side contention",
+        help="Staggered model connections; falls back to 1 without batch support",
     )
 
     parser.add_argument(

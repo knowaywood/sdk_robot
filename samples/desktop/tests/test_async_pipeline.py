@@ -28,6 +28,7 @@ def _make_client():
     client = AsyncDesktopClient.__new__(AsyncDesktopClient)
     client.control_mode = "joints"
     client.interpolate_multiplier = 2
+    client.prefetch_margin = 0.1
     client.blend_steps = 2
     client.world_lock_steps = 3
     client.replan_steps = 10
@@ -77,7 +78,7 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertFalse(client._replan_due(True, 10, 19))
         self.assertTrue(client._replan_due(True, 10, 20))
 
-    def test_prediction_preserves_full_semantic_horizon_after_inference(self):
+    def test_prediction_drops_elapsed_prefix_and_keeps_future_stage(self):
         client = _make_client()
         request = _InferenceRequest(request_id=1, control_step=10)
         prediction = _PredictionChunk(
@@ -100,14 +101,14 @@ class AsyncPipelineTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            [pair[0][0] for pair in result], [-1.0, 0.0, 1.0, 1.5, 2.0]
+            [pair[0][0] for pair in result], [-1.0, 0.5, 2.0]
         )
         self.assertEqual(
             [pair[0][-1] for pair in result],
-            [4.5, 4.5, 4.5, 4.5, 0.0],
+            [4.5, 4.5, 0.0],
         )
 
-    def test_long_inference_does_not_drop_semantic_action_stages(self):
+    def test_long_inference_keeps_enough_actions_for_next_prediction(self):
         client = _make_client()
         prediction = _PredictionChunk(
             request=_InferenceRequest(request_id=1, control_step=10),
@@ -130,6 +131,28 @@ class AsyncPipelineTest(unittest.TestCase):
 
         self.assertEqual(len(result), 5)
         self.assertEqual([pair[0][-1] for pair in result][-1], 0.0)
+
+    def test_latency_trim_reserves_buffer_based_on_worker_throughput(self):
+        client = _make_client()
+
+        self.assertEqual(
+            client._latency_trim_steps(
+                action_count=20,
+                inference_steps=10,
+                inference_latency=0.4,
+            ),
+            10,
+        )
+
+        client._inference_clients = [object()]
+        self.assertEqual(
+            client._latency_trim_steps(
+                action_count=20,
+                inference_steps=10,
+                inference_latency=1.2,
+            ),
+            7,
+        )
 
     def test_world_locked_joint_handoff_converges_to_absolute_target(self):
         client = _make_client()

@@ -76,7 +76,7 @@ class AsyncDesktopClient(DesktopClient):
         gripper_transition_angular_speed: float = 0.6,
         max_linear_speed: float = 0.3,
         max_angular_speed: float = 1.5,
-        inference_workers: int = 1,
+        inference_workers: int = 2,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
@@ -427,6 +427,29 @@ class AsyncDesktopClient(DesktopClient):
             )
         return list(zip(left_actions, right_actions))
 
+    def _latency_trim_steps(
+        self,
+        action_count: int,
+        inference_steps: int,
+        inference_latency: float,
+    ) -> int:
+        if action_count <= 1 or inference_steps <= 0:
+            return 0
+
+        worker_count = max(1, len(self._inference_clients))
+        next_result_seconds = inference_latency / worker_count
+        reserve_steps = max(
+            1,
+            int(
+                np.ceil(
+                    (next_result_seconds + self.prefetch_margin)
+                    / self.control_period
+                )
+            ),
+        )
+        max_trim = max(0, action_count - reserve_steps)
+        return min(inference_steps, max_trim)
+
     def _stitch_prediction(
         self,
         prediction: _PredictionChunk,
@@ -442,12 +465,17 @@ class AsyncDesktopClient(DesktopClient):
         if not prepared:
             return []
 
-        plan_summary = self._format_plan_summary(prepared)
         inference_steps = 0
         if prediction.request.control_step is not None:
             inference_steps = max(
                 0, control_step - prediction.request.control_step
             )
+        latency_trim_steps = self._latency_trim_steps(
+            len(prepared), inference_steps, prediction.latency
+        )
+        if latency_trim_steps:
+            prepared = prepared[latency_trim_steps:]
+        plan_summary = self._format_plan_summary(prepared)
 
         reference = last_command or (active_actions[0] if active_actions else None)
         remaining = prepared
@@ -518,6 +546,8 @@ class AsyncDesktopClient(DesktopClient):
             f"latency={prediction.latency:.3f}s, "
             f"inference_steps={inference_steps}"
             f"({inference_steps * self.control_period:.3f}s), "
+            f"latency_trim={latency_trim_steps}"
+            f"({latency_trim_steps * self.control_period:.3f}s), "
             f"crossfade={overlap_steps}, "
             f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
