@@ -75,27 +75,14 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
                 target_indices, original_indices, actions_np[:, i]
             )
 
-        # NLERP for orientation (3,4,5) - Euler angles
+        # SLERP for orientation (3,4,5) represented as Euler angles.
         if action_dim >= 6:
-            # Convert to quat, interpolate, convert back
-            quaternions = transform.Rotation.from_euler(
+            rotations = transform.Rotation.from_euler(
                 "xyz", actions_np[:, 3:6], degrees=False
-            ).as_quat()
-            interpolated_quats = np.zeros((int(target_num_actions), 4))
-
-            for i in range(4):
-                interpolated_quats[:, i] = np.interp(
-                    target_indices, original_indices, quaternions[:, i]
-                )
-
-            # Normalize quaternions
-            norms = np.linalg.norm(interpolated_quats, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # avoid div by zero
-            interpolated_quats /= norms
-
-            interpolated_actions[:, 3:6] = transform.Rotation.from_quat(
-                interpolated_quats
-            ).as_euler("xyz", degrees=False)
+            )
+            interpolated_actions[:, 3:6] = transform.Slerp(
+                original_indices, rotations
+            )(target_indices).as_euler("xyz", degrees=False)
 
     else:
         # The last dimension is the gripper; only interpolate arm joints here.

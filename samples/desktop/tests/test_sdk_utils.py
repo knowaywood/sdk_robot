@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial import transform
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -55,6 +56,18 @@ class InterpolateTrajectoryTest(unittest.TestCase):
         np.testing.assert_allclose(
             result[:, -1], [4.5, 4.5, 4.5, 0.0, 0.0, 0.0, 3.0]
         )
+
+    def test_end_pose_orientation_takes_short_path_across_pi_boundary(self):
+        actions = [
+            [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(179.0), 4.5],
+            [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(-179.0), 4.5],
+        ]
+
+        result = np.asarray(interpolate_trajectory(actions, factor=10))
+        rotations = transform.Rotation.from_euler("xyz", result[:, 3:6])
+        step_angles = (rotations[:-1].inv() * rotations[1:]).magnitude()
+
+        self.assertLess(np.rad2deg(step_angles.max()), 0.21)
 
 
 class StitchTrajectoryTest(unittest.TestCase):
