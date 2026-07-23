@@ -30,6 +30,7 @@ def _make_client():
     client.interpolate_multiplier = 2
     client.blend_steps = 2
     client.world_lock_steps = 3
+    client.replan_steps = 10
     client.control_period = 0.1
     client.max_linear_speed = 0.2
     client.max_angular_speed = 1.0
@@ -66,6 +67,13 @@ class AsyncPipelineTest(unittest.TestCase):
         next_tick, missed = _next_control_deadline(2.0, 2.004, 0.01)
         self.assertFalse(missed)
         self.assertAlmostEqual(next_tick, 2.01)
+
+    def test_replan_waits_for_committed_action_window(self):
+        client = _make_client()
+
+        self.assertTrue(client._replan_due(False, 10, 11))
+        self.assertFalse(client._replan_due(True, 10, 19))
+        self.assertTrue(client._replan_due(True, 10, 20))
 
     def test_prediction_preserves_full_semantic_horizon_after_inference(self):
         client = _make_client()
@@ -228,6 +236,26 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(inputs["state"]["follow2_pos"][-1], 0.775)
         self.assertAlmostEqual(inputs["state"]["follow1_gripper"], 1.55)
         self.assertAlmostEqual(inputs["state"]["follow2_gripper"], 0.775)
+
+    def test_plan_summary_reports_next_gripper_event(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        client._last_gripper_command = {"left": 0.0, "right": 4.5}
+        prepared = [
+            (
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+            ),
+            (
+                [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+                [0.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+        ]
+
+        summary = client._format_plan_summary(prepared)
+
+        self.assertIn("left:0.100/open@0.10s", summary)
+        self.assertIn("right:0.200/close@0.10s", summary)
 
     def test_gripper_release_requires_stable_request_and_dwell(self):
         client = _make_client()

@@ -19,6 +19,7 @@ def main(args):
         prefetch_margin=args.prefetch_margin,
         blend_duration=args.blend_duration,
         world_lock_duration=args.world_lock_duration,
+        replan_interval=args.replan_interval,
         inference_workers=args.inference_workers,
         gripper_close_confirm=args.gripper_close_confirm,
         gripper_release_confirm=args.gripper_release_confirm,
@@ -102,6 +103,13 @@ def parse_args():
         type=float,
         default=0.25,
         help="Seconds to converge from the handoff state to absolute model targets",
+    )
+
+    parser.add_argument(
+        "--replan-interval",
+        type=float,
+        default=1.0,
+        help="Minimum seconds to execute a plan before replacing it",
     )
 
     parser.add_argument(

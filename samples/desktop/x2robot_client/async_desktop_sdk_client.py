@@ -65,6 +65,7 @@ class AsyncDesktopClient(DesktopClient):
         prefetch_margin: float = 0.1,
         blend_duration: float = 0.2,
         world_lock_duration: float = 0.25,
+        replan_interval: float = 1.0,
         gripper_deadband: float = 0.1,
         gripper_close_confirm: float = 0.15,
         gripper_release_confirm: float = 0.4,
@@ -83,6 +84,7 @@ class AsyncDesktopClient(DesktopClient):
             prefetch_margin < 0
             or blend_duration < 0
             or world_lock_duration < 0
+            or replan_interval <= 0
             or gripper_deadband < 0
             or gripper_close_confirm < 0
             or gripper_release_confirm < 0
@@ -101,6 +103,9 @@ class AsyncDesktopClient(DesktopClient):
         self.prefetch_margin = prefetch_margin
         self.blend_steps = int(round(blend_duration / self.control_period))
         self.world_lock_steps = int(round(world_lock_duration / self.control_period))
+        self.replan_steps = max(
+            1, int(round(replan_interval / self.control_period))
+        )
         self.gripper_deadband = gripper_deadband
         self.gripper_close_confirm = gripper_close_confirm
         self.gripper_release_confirm = gripper_release_confirm
@@ -306,6 +311,18 @@ class AsyncDesktopClient(DesktopClient):
         self._inference_in_flight.add(request.request_id)
         return True
 
+    def _replan_due(
+        self,
+        has_active_actions: bool,
+        last_replan_step: Optional[int],
+        control_step: int,
+    ) -> bool:
+        return (
+            not has_active_actions
+            or last_replan_step is None
+            or control_step - last_replan_step >= self.replan_steps
+        )
+
     def _poll_prediction(self) -> Optional[_PredictionChunk]:
         try:
             prediction = self._prediction_queue.get_nowait()
@@ -389,6 +406,7 @@ class AsyncDesktopClient(DesktopClient):
         if not prepared:
             return []
 
+        plan_summary = self._format_plan_summary(prepared)
         inference_steps = 0
         if prediction.request.control_step is not None:
             inference_steps = max(
@@ -468,6 +486,7 @@ class AsyncDesktopClient(DesktopClient):
             f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
             f"world_lock={self.world_lock_steps}, "
+            f"plan={plan_summary}, "
             f"handoff_error={handoff_error}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
@@ -559,6 +578,45 @@ class AsyncDesktopClient(DesktopClient):
         left_joints = np.linalg.norm(predicted_left[:-1] - reference_left[:-1])
         right_joints = np.linalg.norm(predicted_right[:-1] - reference_right[:-1])
         return f"joints={left_joints:.4f}/{right_joints:.4f}rad"
+
+    def _format_plan_summary(
+        self, prepared: List[Tuple[list, list]]
+    ) -> str:
+        summaries = []
+        for side_index, side in enumerate(("left", "right")):
+            actions = np.asarray(
+                [pair[side_index] for pair in prepared], dtype=float
+            )
+            if self.control_mode == "end_pose":
+                displacement = np.linalg.norm(
+                    actions[:, :3] - actions[0, :3], axis=1
+                )
+            else:
+                displacement = np.linalg.norm(
+                    actions[:, :-1] - actions[0, :-1], axis=1
+                )
+
+            current = self._last_gripper_command[side]
+            event_text = "none"
+            for index, model_value in enumerate(actions[:, -1]):
+                physical = self._gripper_to_physical_range(float(model_value))
+                if physical <= self.GRIPPER_CLOSE_THRESHOLD:
+                    desired = 0.0
+                elif physical >= self.GRIPPER_OPEN_THRESHOLD:
+                    desired = self.GRIPPER_PHYSICAL_MAX
+                else:
+                    continue
+                if current is not None and desired != current:
+                    event_text = (
+                        f"{'open' if desired > 0 else 'close'}@"
+                        f"{index * self.control_period:.2f}s"
+                    )
+                    break
+            summaries.append(
+                f"{side}:{float(np.max(displacement)):.3f}/"
+                f"{event_text}"
+            )
+        return ",".join(summaries)
 
     def _align_actions_to_world_reference(
         self,
@@ -859,6 +917,7 @@ class AsyncDesktopClient(DesktopClient):
             f"prefetch_margin={self.prefetch_margin:.3f}s, "
             f"blend={self.blend_steps * self.control_period:.3f}s, "
             f"world_lock={self.world_lock_steps * self.control_period:.3f}s, "
+            f"replan_interval={self.replan_steps * self.control_period:.3f}s, "
             f"inference_workers={worker_count}, "
             f"gripper_close_confirm={self.gripper_close_confirm:.2f}s, "
             f"gripper_release_confirm={self.gripper_release_confirm:.2f}s, "
@@ -872,6 +931,7 @@ class AsyncDesktopClient(DesktopClient):
         last_command = None
         pending_prediction = None
         control_step = 0
+        last_replan_step = None
         next_tick = time.monotonic()
         last_request_at = next_tick
         last_underflow_log = 0.0
@@ -885,6 +945,7 @@ class AsyncDesktopClient(DesktopClient):
                 if self.remote_control:
                     active_actions.clear()
                     pending_prediction = None
+                    last_replan_step = None
                     self._discard_before_request_id = self._request_counter
                     prediction = self._poll_prediction()
                     if prediction is not None:
@@ -910,7 +971,10 @@ class AsyncDesktopClient(DesktopClient):
                     if latency_history
                     else self.INITIAL_INFERENCE_LATENCY_SECONDS
                 )
-                if pending_prediction is not None:
+                replan_due = self._replan_due(
+                    bool(active_actions), last_replan_step, control_step
+                )
+                if pending_prediction is not None and replan_due:
                     replacement = self._stitch_prediction(
                         pending_prediction,
                         control_step,
@@ -919,6 +983,7 @@ class AsyncDesktopClient(DesktopClient):
                     )
                     if replacement:
                         active_actions = deque(replacement)
+                        last_replan_step = control_step
                         self._last_applied_request_id = (
                             pending_prediction.request.request_id
                         )
