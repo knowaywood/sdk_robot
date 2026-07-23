@@ -59,10 +59,10 @@ class AsyncDesktopClient(DesktopClient):
         self,
         *args,
         control_hz: float = 110.0,
-        prefetch_margin: float = 0.35,
+        prefetch_margin: float = 0.1,
         blend_duration: float = 0.3,
         gripper_deadband: float = 0.05,
-        inference_workers: int = 2,
+        inference_workers: int = 1,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
@@ -310,20 +310,16 @@ class AsyncDesktopClient(DesktopClient):
             prepared, reference, minimum_buffer_steps
         )
         remaining = prepared[alignment_index:]
-        correction_steps = 0
-        if reference is not None and minimum_buffer_steps > 0:
-            correction_steps = min(
-                len(remaining), max(self.blend_steps, minimum_buffer_steps)
-            )
-            left_remaining = self._rebase_actions(
+        rebased = reference is not None and minimum_buffer_steps > 0
+        handoff_error = self._format_handoff_error(remaining[0], reference)
+        if rebased:
+            left_remaining = self._shift_actions_to_reference(
                 [pair[0] for pair in remaining],
                 reference[0],
-                correction_steps,
             )
-            right_remaining = self._rebase_actions(
+            right_remaining = self._shift_actions_to_reference(
                 [pair[1] for pair in remaining],
                 reference[1],
-                correction_steps,
             )
             remaining = list(zip(left_remaining, right_remaining))
         if active_actions:
@@ -364,28 +360,62 @@ class AsyncDesktopClient(DesktopClient):
             f"Prediction #{prediction.request.request_id}: "
             f"latency={prediction.latency:.3f}s, aligned={alignment_index}, "
             f"crossfade={overlap_steps}, "
-            f"correction={correction_steps}, "
+            f"rebased={str(rebased).lower()}, "
+            f"handoff_error={handoff_error}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
         return list(zip(left_actions, right_actions))
 
-    def _rebase_actions(
+    def _format_handoff_error(
+        self,
+        predicted: Tuple[list, list],
+        reference: Optional[Tuple[list, list]],
+    ) -> str:
+        if reference is None:
+            return "initial"
+
+        predicted_left = np.asarray(predicted[0], dtype=float)
+        predicted_right = np.asarray(predicted[1], dtype=float)
+        reference_left = np.asarray(reference[0], dtype=float)
+        reference_right = np.asarray(reference[1], dtype=float)
+        if self.control_mode == "end_pose":
+            left_position = np.linalg.norm(predicted_left[:3] - reference_left[:3])
+            right_position = np.linalg.norm(
+                predicted_right[:3] - reference_right[:3]
+            )
+            left_rotation = (
+                transform.Rotation.from_euler("xyz", reference_left[3:6]).inv()
+                * transform.Rotation.from_euler("xyz", predicted_left[3:6])
+            ).magnitude()
+            right_rotation = (
+                transform.Rotation.from_euler("xyz", reference_right[3:6]).inv()
+                * transform.Rotation.from_euler("xyz", predicted_right[3:6])
+            ).magnitude()
+            return (
+                f"pos={left_position:.4f}/{right_position:.4f}m,"
+                f"rot={np.degrees(left_rotation):.1f}/"
+                f"{np.degrees(right_rotation):.1f}deg"
+            )
+
+        left_joints = np.linalg.norm(predicted_left[:-1] - reference_left[:-1])
+        right_joints = np.linalg.norm(predicted_right[:-1] - reference_right[:-1])
+        return f"joints={left_joints:.4f}/{right_joints:.4f}rad"
+
+    def _shift_actions_to_reference(
         self,
         actions: List[list],
         reference: list,
-        correction_steps: int,
     ) -> List[list]:
-        """Start at the current state and gradually return to the model path."""
-        if not actions or correction_steps <= 0:
+        """Move a trajectory to the handoff state while preserving its increments."""
+        if not actions:
             return [list(action) for action in actions]
 
         corrected = np.asarray(actions, dtype=float).copy()
         reference_array = np.asarray(reference, dtype=float)
-        steps = min(len(corrected), correction_steps)
-        denominator = max(1, steps - 1)
 
         if self.control_mode == "end_pose":
             position_offset = reference_array[:3] - corrected[0, :3]
+            corrected[:, :3] += position_offset
             reference_rotation = transform.Rotation.from_euler(
                 "xyz", reference_array[3:6]
             )
@@ -393,28 +423,15 @@ class AsyncDesktopClient(DesktopClient):
                 "xyz", corrected[0, 3:6]
             )
             rotation_offset = reference_rotation * initial_rotation.inv()
+            target_rotations = transform.Rotation.from_euler(
+                "xyz", corrected[:, 3:6]
+            )
+            corrected[:, 3:6] = (
+                rotation_offset * target_rotations
+            ).as_euler("xyz")
         else:
             joint_offset = reference_array[:-1] - corrected[0, :-1]
-
-        for index in range(steps):
-            progress = index / denominator
-            released = 10 * progress**3 - 15 * progress**4 + 6 * progress**5
-            correction_weight = 1.0 - released
-
-            if self.control_mode == "end_pose":
-                corrected[index, :3] += correction_weight * position_offset
-
-                target_rotation = transform.Rotation.from_euler(
-                    "xyz", corrected[index, 3:6]
-                )
-                weighted_offset = transform.Rotation.from_rotvec(
-                    correction_weight * rotation_offset.as_rotvec()
-                )
-                corrected[index, 3:6] = (
-                    weighted_offset * target_rotation
-                ).as_euler("xyz")
-            else:
-                corrected[index, :-1] += correction_weight * joint_offset
+            corrected[:, :-1] += joint_offset
 
         return corrected.tolist()
 
@@ -556,6 +573,7 @@ class AsyncDesktopClient(DesktopClient):
         active_actions = deque()
         latency_history = deque(maxlen=20)
         last_command = None
+        pending_prediction = None
         control_step = 0
         next_tick = time.monotonic()
         last_request_at = next_tick
@@ -569,6 +587,7 @@ class AsyncDesktopClient(DesktopClient):
             while not self.action_terminator:
                 if self.remote_control:
                     active_actions.clear()
+                    pending_prediction = None
                     self._discard_before_request_id = self._request_counter
                     prediction = self._poll_prediction()
                     if prediction is not None:
@@ -587,37 +606,43 @@ class AsyncDesktopClient(DesktopClient):
                 prediction = self._poll_prediction()
                 if prediction is not None:
                     latency_history.append(prediction.latency)
-                    inference_p95 = float(np.percentile(latency_history, 95))
-                    result_interval = inference_p95 / worker_count
-                    minimum_buffer_steps = int(
-                        np.ceil(
-                            (result_interval + self.prefetch_margin)
-                            / self.control_period
-                        )
-                    )
-                    replacement = self._stitch_prediction(
-                        prediction,
-                        last_command,
-                        list(active_actions),
-                        minimum_buffer_steps,
-                    )
-                    if replacement:
-                        active_actions = deque(replacement)
-                        self._last_applied_request_id = prediction.request.request_id
+                    pending_prediction = prediction
 
                 inference_p95 = (
                     float(np.percentile(latency_history, 95))
                     if latency_history
                     else self.INITIAL_INFERENCE_LATENCY_SECONDS
                 )
+                if pending_prediction is not None and (
+                    not active_actions or len(active_actions) <= self.blend_steps
+                ):
+                    minimum_buffer_steps = int(
+                        np.ceil(
+                            (inference_p95 / worker_count + self.prefetch_margin)
+                            / self.control_period
+                        )
+                    )
+                    replacement = self._stitch_prediction(
+                        pending_prediction,
+                        last_command,
+                        list(active_actions),
+                        minimum_buffer_steps,
+                    )
+                    if replacement:
+                        active_actions = deque(replacement)
+                        self._last_applied_request_id = (
+                            pending_prediction.request.request_id
+                        )
+                    pending_prediction = None
+
                 request_interval = max(
                     self.control_period,
                     inference_p95 / worker_count,
                 )
-                if (
-                    len(self._inference_in_flight) < worker_count
-                    and now - last_request_at >= request_interval
-                ):
+                request_due = worker_count == 1 or (
+                    now - last_request_at >= request_interval
+                )
+                if len(self._inference_in_flight) < worker_count and request_due:
                     request_step = control_step if active_actions else None
                     if self._request_prediction(request_step):
                         last_request_at = now

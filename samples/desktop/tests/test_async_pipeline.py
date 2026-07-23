@@ -112,19 +112,18 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertEqual(index, 2)
         self.assertEqual(len(prepared[index:]), 4)
 
-    def test_rebase_releases_joint_offset_smoothly(self):
+    def test_relative_joint_handoff_preserves_trajectory_increments(self):
         client = _make_client()
 
-        result = client._rebase_actions(
+        result = client._shift_actions_to_reference(
             [[2.0, 4.5], [4.0, 4.5], [6.0, 0.0]],
             reference=[0.0, 4.5],
-            correction_steps=3,
         )
 
-        self.assertEqual([action[0] for action in result], [0.0, 3.0, 6.0])
+        self.assertEqual([action[0] for action in result], [0.0, 2.0, 4.0])
         self.assertEqual([action[-1] for action in result], [4.5, 4.5, 0.0])
 
-    def test_rebase_end_pose_starts_at_reference_and_keeps_target(self):
+    def test_relative_end_pose_handoff_preserves_motion(self):
         client = _make_client()
         client.control_mode = "end_pose"
         actions = [
@@ -134,15 +133,22 @@ class AsyncPipelineTest(unittest.TestCase):
         ]
         reference = [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(179.0), 4.5]
 
-        result = np.asarray(client._rebase_actions(actions, reference, 3))
+        result = np.asarray(client._shift_actions_to_reference(actions, reference))
         rotations = transform.Rotation.from_euler("xyz", result[:, 3:6])
         reference_rotation = transform.Rotation.from_euler("xyz", reference[3:6])
-        target_rotation = transform.Rotation.from_euler("xyz", actions[-1][3:6])
+        source_rotations = transform.Rotation.from_euler(
+            "xyz", np.asarray(actions)[:, 3:6]
+        )
 
         self.assertAlmostEqual(result[0, 0], reference[0])
-        self.assertAlmostEqual(result[-1, 0], actions[-1][0])
+        np.testing.assert_allclose(
+            np.diff(result[:, 0]), np.diff(np.asarray(actions)[:, 0])
+        )
         self.assertLess((reference_rotation.inv() * rotations[0]).magnitude(), 1e-8)
-        self.assertLess((target_rotation.inv() * rotations[-1]).magnitude(), 1e-8)
+        np.testing.assert_allclose(
+            (rotations[:-1].inv() * rotations[1:]).magnitude(),
+            (source_rotations[:-1].inv() * source_rotations[1:]).magnitude(),
+        )
         self.assertEqual(result[:, -1].tolist(), [4.5, 4.5, 0.0])
 
     def test_request_queue_allows_one_request_per_worker(self):

@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--prefetch-margin",
         type=float,
-        default=0.35,
+        default=0.1,
         help="Extra action-buffer time kept beyond measured inference latency",
     )
 
@@ -91,10 +91,10 @@ def parse_args():
     parser.add_argument(
         "--inference-workers",
         type=int,
-        default=2,
+        default=1,
         choices=range(1, 5),
         metavar="{1,2,3,4}",
-        help="Number of staggered model connections; 2 is recommended",
+        help="Number of model connections; 1 avoids server-side contention",
     )
 
     parser.add_argument(
