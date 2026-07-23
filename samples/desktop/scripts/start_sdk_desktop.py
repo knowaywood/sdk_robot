@@ -69,21 +69,21 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=120.0,
-        help="Robot command frequency; 120 Hz is recommended, maximum is 200 Hz",
+        default=110.0,
+        help="Robot command frequency; 110 Hz is recommended, maximum is 200 Hz",
     )
 
     parser.add_argument(
         "--prefetch-margin",
         type=float,
-        default=0.2,
+        default=0.35,
         help="Extra action-buffer time kept beyond measured inference latency",
     )
 
     parser.add_argument(
         "--blend-duration",
         type=float,
-        default=0.15,
+        default=0.3,
         help="Arm trajectory blend duration when replacing an action chunk",
     )
 

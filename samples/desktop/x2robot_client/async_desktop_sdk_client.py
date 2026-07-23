@@ -56,9 +56,9 @@ class AsyncDesktopClient(DesktopClient):
     def __init__(
         self,
         *args,
-        control_hz: float = 120.0,
-        prefetch_margin: float = 0.2,
-        blend_duration: float = 0.15,
+        control_hz: float = 110.0,
+        prefetch_margin: float = 0.35,
+        blend_duration: float = 0.3,
         gripper_deadband: float = 0.05,
         **kwargs,
     ):
@@ -237,7 +237,6 @@ class AsyncDesktopClient(DesktopClient):
     def _stitch_prediction(
         self,
         prediction: _PredictionChunk,
-        control_step: int,
         last_command: Optional[Tuple[list, list]],
         active_actions: List[Tuple[list, list]],
     ) -> List[Tuple[list, list]]:
@@ -249,18 +248,9 @@ class AsyncDesktopClient(DesktopClient):
         if not prepared:
             return []
 
-        elapsed_steps = 0
-        if prediction.request.control_step is not None:
-            elapsed_steps = max(0, control_step - prediction.request.control_step)
-
-        if elapsed_steps >= len(prepared):
-            logger.warning(
-                f"Discarding stale prediction #{prediction.request.request_id}: "
-                f"elapsed={elapsed_steps}, chunk={len(prepared)}"
-            )
-            return []
-
-        remaining = prepared[elapsed_steps:]
+        reference = active_actions[0] if active_actions else last_command
+        alignment_index = self._find_alignment_index(prepared, reference)
+        remaining = prepared[alignment_index:]
         if active_actions:
             left_actions = crossfade_trajectories(
                 [pair[0] for pair in active_actions],
@@ -297,11 +287,52 @@ class AsyncDesktopClient(DesktopClient):
         )
         logger.info(
             f"Prediction #{prediction.request.request_id}: "
-            f"latency={prediction.latency:.3f}s, skipped={elapsed_steps}, "
+            f"latency={prediction.latency:.3f}s, aligned={alignment_index}, "
             f"crossfade={overlap_steps}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
         return list(zip(left_actions, right_actions))
+
+    def _find_alignment_index(
+        self,
+        prepared: List[Tuple[list, list]],
+        reference: Optional[Tuple[list, list]],
+    ) -> int:
+        if reference is None or len(prepared) <= 1:
+            return 0
+
+        minimum_remaining = max(1, self.blend_steps)
+        candidate_count = max(1, len(prepared) - minimum_remaining + 1)
+        left = np.asarray([pair[0] for pair in prepared[:candidate_count]])
+        right = np.asarray([pair[1] for pair in prepared[:candidate_count]])
+        left_reference = np.asarray(reference[0])
+        right_reference = np.asarray(reference[1])
+
+        if self.control_mode == "end_pose":
+            position_cost = np.linalg.norm(
+                left[:, :3] - left_reference[:3], axis=1
+            ) + np.linalg.norm(right[:, :3] - right_reference[:3], axis=1)
+            left_reference_rotation = transform.Rotation.from_euler(
+                "xyz", left_reference[3:6]
+            )
+            right_reference_rotation = transform.Rotation.from_euler(
+                "xyz", right_reference[3:6]
+            )
+            left_angle = (
+                left_reference_rotation.inv()
+                * transform.Rotation.from_euler("xyz", left[:, 3:6])
+            ).magnitude()
+            right_angle = (
+                right_reference_rotation.inv()
+                * transform.Rotation.from_euler("xyz", right[:, 3:6])
+            ).magnitude()
+            cost = position_cost + 0.1 * (left_angle + right_angle)
+        else:
+            cost = np.linalg.norm(
+                left[:, :-1] - left_reference[:-1], axis=1
+            ) + np.linalg.norm(right[:, :-1] - right_reference[:-1], axis=1)
+
+        return int(np.argmin(cost))
 
     def _send_gripper_if_needed(self, side: str, gripper, position: float, now: float):
         previous = self._last_gripper_command[side]
@@ -397,6 +428,7 @@ class AsyncDesktopClient(DesktopClient):
         active_actions = deque()
         latency_history = deque(maxlen=20)
         last_command = None
+        pending_prediction = None
         control_step = 0
         next_tick = time.monotonic()
         last_underflow_log = 0.0
@@ -409,6 +441,7 @@ class AsyncDesktopClient(DesktopClient):
             while not self.action_terminator:
                 if self.remote_control:
                     active_actions.clear()
+                    pending_prediction = None
                     self._discard_before_request_id = self._request_counter
                     prediction = self._poll_prediction()
                     if prediction is not None:
@@ -427,14 +460,17 @@ class AsyncDesktopClient(DesktopClient):
                 prediction = self._poll_prediction()
                 if prediction is not None:
                     latency_history.append(prediction.latency)
+                    pending_prediction = prediction
+
+                if pending_prediction is not None and (
+                    not active_actions or len(active_actions) <= self.blend_steps
+                ):
                     replacement = self._stitch_prediction(
-                        prediction,
-                        control_step,
-                        last_command,
-                        list(active_actions),
+                        pending_prediction, last_command, list(active_actions)
                     )
                     if replacement:
                         active_actions = deque(replacement)
+                    pending_prediction = None
 
                 inference_p95 = (
                     float(np.percentile(latency_history, 95))
@@ -450,7 +486,7 @@ class AsyncDesktopClient(DesktopClient):
                         )
                     ),
                 )
-                if not self._inference_in_flight and (
+                if pending_prediction is None and not self._inference_in_flight and (
                     not active_actions or len(active_actions) <= prefetch_steps
                 ):
                     request_step = control_step if active_actions else None

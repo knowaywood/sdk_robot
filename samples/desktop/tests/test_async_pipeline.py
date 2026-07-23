@@ -26,6 +26,7 @@ def _make_client():
     client.interpolate_multiplier = 2
     client.blend_steps = 2
     client.gripper_deadband = 0.05
+    client.GRIPPER_DATA_MAX = 4.5
     client._last_gripper_command = {"left": None, "right": None}
     client._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
     return client
@@ -41,7 +42,7 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertFalse(missed)
         self.assertAlmostEqual(next_tick, 2.01)
 
-    def test_prediction_skips_steps_executed_while_inference_was_running(self):
+    def test_prediction_aligns_to_current_state_without_time_based_skip(self):
         client = _make_client()
         request = _InferenceRequest(request_id=1, control_step=10)
         prediction = _PredictionChunk(
@@ -58,13 +59,32 @@ class AsyncPipelineTest(unittest.TestCase):
 
         result = client._stitch_prediction(
             prediction,
-            control_step=12,
             last_command=([-1.0, 4.5], [-1.0, 4.5]),
             active_actions=[],
         )
 
-        self.assertEqual([pair[0][0] for pair in result], [0.0, 1.0, 1.5, 2.0])
-        self.assertEqual([pair[0][-1] for pair in result], [4.5, 4.5, 4.5, 0.0])
+        self.assertEqual(
+            [pair[0][0] for pair in result], [-0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
+        )
+        self.assertEqual(
+            [pair[0][-1] for pair in result],
+            [4.5, 4.5, 4.5, 4.5, 4.5, 0.0],
+        )
+
+    def test_alignment_uses_nearest_dual_arm_state_instead_of_elapsed_time(self):
+        client = _make_client()
+        prepared = [
+            ([0.0, 4.5], [0.0, 4.5]),
+            ([1.0, 4.5], [1.0, 4.5]),
+            ([2.0, 4.5], [2.0, 4.5]),
+            ([3.0, 4.5], [3.0, 4.5]),
+        ]
+
+        index = client._find_alignment_index(
+            prepared, ([1.1, 4.5], [0.9, 4.5])
+        )
+
+        self.assertEqual(index, 1)
 
     def test_gripper_deadband_suppresses_duplicate_rpc_calls(self):
         client = _make_client()
