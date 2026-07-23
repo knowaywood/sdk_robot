@@ -53,18 +53,23 @@ class AsyncDesktopClient(DesktopClient):
 
     GRIPPER_PHYSICAL_MAX = 4.5
     GRIPPER_HEARTBEAT_SECONDS = 1.0
+    GRIPPER_CLOSE_THRESHOLD = 1.0
+    GRIPPER_OPEN_THRESHOLD = 3.5
     INITIAL_INFERENCE_LATENCY_SECONDS = 1.2
 
     def __init__(
         self,
         *args,
-        control_hz: float = 120.0,
-        prefetch_margin: float = 0.05,
+        control_hz: float = 110.0,
+        prefetch_margin: float = 0.1,
         blend_duration: float = 0.3,
+        world_lock_duration: float = 0.5,
         gripper_deadband: float = 0.1,
-        gripper_release_confirm: float = 0.12,
+        gripper_release_confirm: float = 0.2,
+        gripper_reopen_dwell: float = 0.6,
+        max_linear_speed: float = 0.3,
+        max_angular_speed: float = 1.5,
         inference_workers: int = 1,
-        motion_scale: float = 1.0,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
@@ -72,22 +77,27 @@ class AsyncDesktopClient(DesktopClient):
         if (
             prefetch_margin < 0
             or blend_duration < 0
+            or world_lock_duration < 0
             or gripper_deadband < 0
             or gripper_release_confirm < 0
+            or gripper_reopen_dwell < 0
+            or max_linear_speed <= 0
+            or max_angular_speed <= 0
         ):
             raise ValueError("pipeline timing and deadband values must be non-negative")
         if inference_workers < 1 or inference_workers > 4:
             raise ValueError("inference_workers must be in the range [1, 4]")
-        if motion_scale <= 0 or motion_scale > 2:
-            raise ValueError("motion_scale must be in the range (0, 2]")
 
         self.control_period = 1.0 / control_hz
         self.prefetch_margin = prefetch_margin
         self.blend_steps = int(round(blend_duration / self.control_period))
+        self.world_lock_steps = int(round(world_lock_duration / self.control_period))
         self.gripper_deadband = gripper_deadband
         self.gripper_release_confirm = gripper_release_confirm
+        self.gripper_reopen_dwell = gripper_reopen_dwell
+        self.max_linear_speed = max_linear_speed
+        self.max_angular_speed = max_angular_speed
         self.inference_workers = inference_workers
-        self.motion_scale = motion_scale
 
         self._request_queue = queue.Queue(maxsize=inference_workers)
         self._prediction_queue = queue.Queue(maxsize=2 * inference_workers)
@@ -102,6 +112,7 @@ class AsyncDesktopClient(DesktopClient):
         self._last_gripper_command = {"left": None, "right": None}
         self._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
         self._gripper_release_candidate = {"left": None, "right": None}
+        self._motion_limit_count = 0
 
         super().__init__(*args, **kwargs)
 
@@ -317,25 +328,21 @@ class AsyncDesktopClient(DesktopClient):
         if not prepared:
             return []
 
-        reference = active_actions[0] if active_actions else last_command
+        reference = last_command or (active_actions[0] if active_actions else None)
         alignment_index = self._find_alignment_index(
             prepared, reference, minimum_buffer_steps
         )
         remaining = prepared[alignment_index:]
         rebased = reference is not None and minimum_buffer_steps > 0
         handoff_error = self._format_handoff_error(remaining[0], reference)
-        if rebased or self.motion_scale != 1.0:
-            left_reference = reference[0] if reference is not None else remaining[0][0]
-            right_reference = (
-                reference[1] if reference is not None else remaining[0][1]
-            )
-            left_remaining = self._shift_actions_to_reference(
+        if rebased:
+            left_remaining = self._align_actions_to_world_reference(
                 [pair[0] for pair in remaining],
-                left_reference,
+                reference[0],
             )
-            right_remaining = self._shift_actions_to_reference(
+            right_remaining = self._align_actions_to_world_reference(
                 [pair[1] for pair in remaining],
-                right_reference,
+                reference[1],
             )
             remaining = list(zip(left_remaining, right_remaining))
         use_velocity_blend = bool(active_actions) or (
@@ -394,6 +401,7 @@ class AsyncDesktopClient(DesktopClient):
             f"crossfade={overlap_steps}, "
             f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
+            f"world_lock={self.world_lock_steps}, "
             f"handoff_error={handoff_error}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
@@ -486,44 +494,49 @@ class AsyncDesktopClient(DesktopClient):
         right_joints = np.linalg.norm(predicted_right[:-1] - reference_right[:-1])
         return f"joints={left_joints:.4f}/{right_joints:.4f}rad"
 
-    def _shift_actions_to_reference(
+    def _align_actions_to_world_reference(
         self,
         actions: List[list],
         reference: list,
     ) -> List[list]:
-        """Move a trajectory to the handoff state while preserving its increments."""
+        """Start at the handoff state, then converge to absolute model targets."""
         if not actions:
             return [list(action) for action in actions]
 
         corrected = np.asarray(actions, dtype=float).copy()
         reference_array = np.asarray(reference, dtype=float)
+        correction_steps = min(len(corrected), max(1, self.world_lock_steps))
+        denominator = max(1, correction_steps - 1)
 
         if self.control_mode == "end_pose":
-            initial_position = corrected[0, :3].copy()
-            corrected[:, :3] = reference_array[:3] + self.motion_scale * (
-                corrected[:, :3] - initial_position
-            )
+            position_offset = reference_array[:3] - corrected[0, :3]
             reference_rotation = transform.Rotation.from_euler(
                 "xyz", reference_array[3:6]
             )
             initial_rotation = transform.Rotation.from_euler(
                 "xyz", corrected[0, 3:6]
             )
-            target_rotations = transform.Rotation.from_euler(
-                "xyz", corrected[:, 3:6]
-            )
-            relative_rotations = initial_rotation.inv() * target_rotations
-            scaled_rotations = transform.Rotation.from_rotvec(
-                self.motion_scale * relative_rotations.as_rotvec()
-            )
-            corrected[:, 3:6] = (
-                reference_rotation * scaled_rotations
-            ).as_euler("xyz")
+            rotation_offset = reference_rotation * initial_rotation.inv()
         else:
-            initial_joints = corrected[0, :-1].copy()
-            corrected[:, :-1] = reference_array[:-1] + self.motion_scale * (
-                corrected[:, :-1] - initial_joints
-            )
+            joint_offset = reference_array[:-1] - corrected[0, :-1]
+
+        for index in range(correction_steps):
+            progress = index / denominator
+            released = 10 * progress**3 - 15 * progress**4 + 6 * progress**5
+            correction_weight = 1.0 - released
+            if self.control_mode == "end_pose":
+                corrected[index, :3] += correction_weight * position_offset
+                target_rotation = transform.Rotation.from_euler(
+                    "xyz", corrected[index, 3:6]
+                )
+                weighted_offset = transform.Rotation.from_rotvec(
+                    correction_weight * rotation_offset.as_rotvec()
+                )
+                corrected[index, 3:6] = (
+                    weighted_offset * target_rotation
+                ).as_euler("xyz")
+            else:
+                corrected[index, :-1] += correction_weight * joint_offset
 
         return corrected.tolist()
 
@@ -570,6 +583,14 @@ class AsyncDesktopClient(DesktopClient):
         return int(np.argmin(cost))
 
     def _send_gripper_if_needed(self, side: str, gripper, position: float, now: float):
+        if position <= self.GRIPPER_CLOSE_THRESHOLD:
+            position = 0.0
+        elif position >= self.GRIPPER_OPEN_THRESHOLD:
+            position = self.GRIPPER_PHYSICAL_MAX
+        else:
+            self._gripper_release_candidate[side] = None
+            return
+
         previous = self._last_gripper_command[side]
         if previous is not None and position > previous + self.gripper_deadband:
             candidate = self._gripper_release_candidate[side]
@@ -577,6 +598,8 @@ class AsyncDesktopClient(DesktopClient):
                 self._gripper_release_candidate[side] = (position, now)
                 return
             if now - candidate[1] < self.gripper_release_confirm:
+                return
+            if now - self._last_gripper_sent_at[side] < self.gripper_reopen_dwell:
                 return
         else:
             self._gripper_release_candidate[side] = None
@@ -603,8 +626,55 @@ class AsyncDesktopClient(DesktopClient):
         scaled = value / self._model_gripper_max() * self.GRIPPER_PHYSICAL_MAX
         return max(0.0, min(self.GRIPPER_PHYSICAL_MAX, scaled))
 
-    def _send_action_step(self, left_action: list, right_action: list):
+    def _limit_end_pose_action(
+        self, action: list, previous_action: Optional[list]
+    ) -> list:
+        if previous_action is None:
+            return list(action)
+
+        limited = np.asarray(action, dtype=float).copy()
+        previous = np.asarray(previous_action, dtype=float)
+        max_linear_step = self.max_linear_speed * self.control_period
+        position_delta = limited[:3] - previous[:3]
+        position_distance = np.linalg.norm(position_delta)
+        was_limited = False
+        if position_distance > max_linear_step:
+            limited[:3] = previous[:3] + position_delta * (
+                max_linear_step / position_distance
+            )
+            was_limited = True
+
+        previous_rotation = transform.Rotation.from_euler("xyz", previous[3:6])
+        target_rotation = transform.Rotation.from_euler("xyz", limited[3:6])
+        rotation_delta = previous_rotation.inv() * target_rotation
+        rotation_vector = rotation_delta.as_rotvec()
+        rotation_angle = np.linalg.norm(rotation_vector)
+        max_angular_step = self.max_angular_speed * self.control_period
+        if rotation_angle > max_angular_step:
+            limited_rotation = previous_rotation * transform.Rotation.from_rotvec(
+                rotation_vector * (max_angular_step / rotation_angle)
+            )
+            limited[3:6] = limited_rotation.as_euler("xyz")
+            was_limited = True
+
+        self._motion_limit_count += int(was_limited)
+        return limited.tolist()
+
+    def _send_action_step(
+        self,
+        left_action: list,
+        right_action: list,
+        previous_command: Optional[Tuple[list, list]] = None,
+    ) -> Tuple[list, list]:
         if self.control_mode == "end_pose":
+            left_action = self._limit_end_pose_action(
+                left_action,
+                previous_command[0] if previous_command is not None else None,
+            )
+            right_action = self._limit_end_pose_action(
+                right_action,
+                previous_command[1] if previous_command is not None else None,
+            )
             left_quat = transform.Rotation.from_euler(
                 "xyz", left_action[3:6]
             ).as_quat()
@@ -662,6 +732,7 @@ class AsyncDesktopClient(DesktopClient):
             self._gripper_to_physical_range(float(right_action[-1])),
             now,
         )
+        return left_action, right_action
 
     def execute_model(self) -> None:
         """Run staggered inference and receding-horizon robot control."""
@@ -675,9 +746,11 @@ class AsyncDesktopClient(DesktopClient):
             f"{self.interpolate_multiplier * self.control_period:.4f}s, "
             f"prefetch_margin={self.prefetch_margin:.3f}s, "
             f"blend={self.blend_steps * self.control_period:.3f}s, "
+            f"world_lock={self.world_lock_steps * self.control_period:.3f}s, "
             f"inference_workers={worker_count}, "
-            f"motion_scale={self.motion_scale:.2f}, "
-            f"gripper_release_confirm={self.gripper_release_confirm:.2f}s"
+            f"gripper_release_confirm={self.gripper_release_confirm:.2f}s, "
+            f"max_linear_speed={self.max_linear_speed:.2f}m/s, "
+            f"max_angular_speed={self.max_angular_speed:.2f}rad/s"
         )
 
         active_actions = deque()
@@ -723,9 +796,7 @@ class AsyncDesktopClient(DesktopClient):
                     if latency_history
                     else self.INITIAL_INFERENCE_LATENCY_SECONDS
                 )
-                if pending_prediction is not None and (
-                    not active_actions or len(active_actions) <= self.blend_steps
-                ):
+                if pending_prediction is not None:
                     minimum_buffer_steps = int(
                         np.ceil(
                             (inference_p95 / worker_count + self.prefetch_margin)
@@ -760,11 +831,13 @@ class AsyncDesktopClient(DesktopClient):
                 if active_actions:
                     left_action, right_action = active_actions.popleft()
                     command_started = time.monotonic()
-                    self._send_action_step(left_action, right_action)
+                    sent_action = self._send_action_step(
+                        left_action, right_action, last_command
+                    )
                     command_duration_history.append(
                         time.monotonic() - command_started
                     )
-                    last_command = (left_action, right_action)
+                    last_command = sent_action
                     control_step += 1
                 elif now - last_underflow_log >= 1.0:
                     logger.warning("Action buffer underflow; holding the last command")
@@ -782,6 +855,7 @@ class AsyncDesktopClient(DesktopClient):
                         f"infer_p95={inference_p95:.3f}s, "
                         f"result_interval={request_interval:.3f}s, "
                         f"in_flight={len(self._inference_in_flight)}, "
+                        f"motion_limits={self._motion_limit_count}, "
                         f"command_p95={command_p95:.4f}s, "
                         f"deadline_misses={deadline_misses}"
                     )

@@ -18,9 +18,12 @@ def main(args):
         control_hz=args.control_hz,
         prefetch_margin=args.prefetch_margin,
         blend_duration=args.blend_duration,
+        world_lock_duration=args.world_lock_duration,
         inference_workers=args.inference_workers,
-        motion_scale=args.motion_scale,
         gripper_release_confirm=args.gripper_release_confirm,
+        gripper_reopen_dwell=args.gripper_reopen_dwell,
+        max_linear_speed=args.max_linear_speed,
+        max_angular_speed=args.max_angular_speed,
     )
 
     try:
@@ -72,14 +75,14 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=120.0,
-        help="Robot command frequency; 120 Hz is recommended, maximum is 200 Hz",
+        default=110.0,
+        help="Robot command frequency; 110 Hz is recommended, maximum is 200 Hz",
     )
 
     parser.add_argument(
         "--prefetch-margin",
         type=float,
-        default=0.05,
+        default=0.1,
         help="Extra action-buffer time kept beyond measured inference latency",
     )
 
@@ -88,6 +91,13 @@ def parse_args():
         type=float,
         default=0.3,
         help="Arm trajectory blend duration when replacing an action chunk",
+    )
+
+    parser.add_argument(
+        "--world-lock-duration",
+        type=float,
+        default=0.5,
+        help="Seconds to converge from the handoff state to absolute model targets",
     )
 
     parser.add_argument(
@@ -100,17 +110,31 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--motion-scale",
+        "--gripper-release-confirm",
         type=float,
-        default=1.0,
-        help="Scale arm trajectory increments without shortening the action buffer",
+        default=0.2,
+        help="Seconds an opening command must remain stable before release",
     )
 
     parser.add_argument(
-        "--gripper-release-confirm",
+        "--gripper-reopen-dwell",
         type=float,
-        default=0.12,
-        help="Seconds an opening command must remain stable before release",
+        default=0.6,
+        help="Minimum seconds before a closed gripper may reopen",
+    )
+
+    parser.add_argument(
+        "--max-linear-speed",
+        type=float,
+        default=0.3,
+        help="Maximum Cartesian translation speed in meters per second",
+    )
+
+    parser.add_argument(
+        "--max-angular-speed",
+        type=float,
+        default=1.5,
+        help="Maximum Cartesian rotation speed in radians per second",
     )
 
     parser.add_argument(

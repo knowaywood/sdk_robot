@@ -29,7 +29,11 @@ def _make_client():
     client.control_mode = "joints"
     client.interpolate_multiplier = 2
     client.blend_steps = 2
-    client.motion_scale = 1.0
+    client.world_lock_steps = 3
+    client.control_period = 0.1
+    client.max_linear_speed = 0.2
+    client.max_angular_speed = 1.0
+    client._motion_limit_count = 0
     client._inference_clients = [object(), object()]
     client._inference_in_flight = set()
     client._request_queue = Queue(maxsize=2)
@@ -38,7 +42,8 @@ def _make_client():
     client._discard_before_request_id = 0
     client._last_applied_request_id = 0
     client.gripper_deadband = 0.05
-    client.gripper_release_confirm = 0.12
+    client.gripper_release_confirm = 0.2
+    client.gripper_reopen_dwell = 0.6
     client.GRIPPER_DATA_MAX = 4.5
     client._last_gripper_command = {"left": None, "right": None}
     client._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
@@ -115,22 +120,10 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertEqual(index, 2)
         self.assertEqual(len(prepared[index:]), 4)
 
-    def test_relative_joint_handoff_preserves_trajectory_increments(self):
+    def test_world_locked_joint_handoff_converges_to_absolute_target(self):
         client = _make_client()
 
-        result = client._shift_actions_to_reference(
-            [[2.0, 4.5], [4.0, 4.5], [6.0, 0.0]],
-            reference=[0.0, 4.5],
-        )
-
-        self.assertEqual([action[0] for action in result], [0.0, 2.0, 4.0])
-        self.assertEqual([action[-1] for action in result], [4.5, 4.5, 0.0])
-
-    def test_motion_scale_increases_joint_trajectory_increments(self):
-        client = _make_client()
-        client.motion_scale = 1.5
-
-        result = client._shift_actions_to_reference(
+        result = client._align_actions_to_world_reference(
             [[2.0, 4.5], [4.0, 4.5], [6.0, 0.0]],
             reference=[0.0, 4.5],
         )
@@ -152,7 +145,21 @@ class AsyncPipelineTest(unittest.TestCase):
         )
         self.assertEqual([action[-1] for action in result], [4.5] * 5)
 
-    def test_relative_end_pose_handoff_preserves_motion(self):
+    def test_end_pose_speed_limiter_caps_translation_and_rotation(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        previous = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5]
+        target = [0.1, 0.0, 0.0, 0.0, 0.0, 0.5, 4.5]
+
+        result = client._limit_end_pose_action(target, previous)
+        result_rotation = transform.Rotation.from_euler("xyz", result[3:6])
+
+        self.assertAlmostEqual(result[0], 0.02)
+        self.assertAlmostEqual(result_rotation.magnitude(), 0.1)
+        self.assertEqual(result[-1], 4.5)
+        self.assertEqual(client._motion_limit_count, 1)
+
+    def test_world_locked_end_pose_handoff_keeps_absolute_target(self):
         client = _make_client()
         client.control_mode = "end_pose"
         actions = [
@@ -162,22 +169,17 @@ class AsyncPipelineTest(unittest.TestCase):
         ]
         reference = [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(179.0), 4.5]
 
-        result = np.asarray(client._shift_actions_to_reference(actions, reference))
+        result = np.asarray(
+            client._align_actions_to_world_reference(actions, reference)
+        )
         rotations = transform.Rotation.from_euler("xyz", result[:, 3:6])
         reference_rotation = transform.Rotation.from_euler("xyz", reference[3:6])
-        source_rotations = transform.Rotation.from_euler(
-            "xyz", np.asarray(actions)[:, 3:6]
-        )
+        target_rotation = transform.Rotation.from_euler("xyz", actions[-1][3:6])
 
         self.assertAlmostEqual(result[0, 0], reference[0])
-        np.testing.assert_allclose(
-            np.diff(result[:, 0]), np.diff(np.asarray(actions)[:, 0])
-        )
+        self.assertAlmostEqual(result[-1, 0], actions[-1][0])
         self.assertLess((reference_rotation.inv() * rotations[0]).magnitude(), 1e-8)
-        np.testing.assert_allclose(
-            (rotations[:-1].inv() * rotations[1:]).magnitude(),
-            (source_rotations[:-1].inv() * source_rotations[1:]).magnitude(),
-        )
+        self.assertLess((target_rotation.inv() * rotations[-1]).magnitude(), 1e-8)
         self.assertEqual(result[:, -1].tolist(), [4.5, 4.5, 0.0])
 
     def test_request_queue_allows_one_request_per_worker(self):
@@ -211,29 +213,31 @@ class AsyncPipelineTest(unittest.TestCase):
         client = _make_client()
         gripper = _RecordingGripper()
 
-        client._send_gripper_if_needed("left", gripper, 2.0, now=1.0)
-        client._send_gripper_if_needed("left", gripper, 2.02, now=1.1)
-        client._send_gripper_if_needed("left", gripper, 2.2, now=1.2)
-        client._send_gripper_if_needed("left", gripper, 2.2, now=1.35)
-        client._send_gripper_if_needed("left", gripper, 2.2, now=2.4)
+        client._send_gripper_if_needed("left", gripper, 0.0, now=1.0)
+        client._send_gripper_if_needed("left", gripper, 2.0, now=1.1)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=1.2)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=1.45)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=1.65)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=2.7)
 
-        self.assertEqual(gripper.positions, [2.0, 2.2, 2.2])
+        self.assertEqual(gripper.positions, [0.0, 4.5, 4.5])
 
     def test_gripper_close_is_immediate(self):
         client = _make_client()
         gripper = _RecordingGripper()
 
         client._send_gripper_if_needed("right", gripper, 4.0, now=1.0)
-        client._send_gripper_if_needed("right", gripper, 1.0, now=1.01)
+        client._send_gripper_if_needed("right", gripper, 0.5, now=1.01)
 
-        self.assertEqual(gripper.positions, [4.0, 1.0])
+        self.assertEqual(gripper.positions, [4.5, 0.0])
 
     def test_gripper_release_noise_does_not_open_gripper(self):
         client = _make_client()
         gripper = _RecordingGripper()
 
-        client._send_gripper_if_needed("left", gripper, 1.0, now=1.0)
+        client._send_gripper_if_needed("left", gripper, 0.5, now=1.0)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.05)
-        client._send_gripper_if_needed("left", gripper, 1.0, now=1.1)
+        client._send_gripper_if_needed("left", gripper, 2.0, now=1.1)
+        client._send_gripper_if_needed("left", gripper, 0.5, now=1.2)
 
-        self.assertEqual(gripper.positions, [1.0])
+        self.assertEqual(gripper.positions, [0.0])
