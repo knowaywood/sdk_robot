@@ -18,6 +18,7 @@ def main(args):
         control_hz=args.control_hz,
         prefetch_margin=args.prefetch_margin,
         blend_duration=args.blend_duration,
+        inference_workers=args.inference_workers,
     )
 
     try:
@@ -85,6 +86,15 @@ def parse_args():
         type=float,
         default=0.3,
         help="Arm trajectory blend duration when replacing an action chunk",
+    )
+
+    parser.add_argument(
+        "--inference-workers",
+        type=int,
+        default=2,
+        choices=range(1, 5),
+        metavar="{1,2,3,4}",
+        help="Number of staggered model connections; 2 is recommended",
     )
 
     parser.add_argument(

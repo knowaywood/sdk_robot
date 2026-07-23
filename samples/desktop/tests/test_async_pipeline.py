@@ -1,6 +1,10 @@
 import sys
 import unittest
+from queue import Queue
 from pathlib import Path
+
+import numpy as np
+from scipy.spatial import transform
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,6 +29,13 @@ def _make_client():
     client.control_mode = "joints"
     client.interpolate_multiplier = 2
     client.blend_steps = 2
+    client._inference_clients = [object(), object()]
+    client._inference_in_flight = set()
+    client._request_queue = Queue(maxsize=2)
+    client._prediction_queue = Queue(maxsize=4)
+    client._request_counter = 0
+    client._discard_before_request_id = 0
+    client._last_applied_request_id = 0
     client.gripper_deadband = 0.05
     client.GRIPPER_DATA_MAX = 4.5
     client._last_gripper_command = {"left": None, "right": None}
@@ -85,6 +96,81 @@ class AsyncPipelineTest(unittest.TestCase):
         )
 
         self.assertEqual(index, 1)
+
+    def test_alignment_keeps_enough_actions_for_next_prediction(self):
+        client = _make_client()
+        prepared = [
+            ([float(index), 4.5], [float(index), 4.5]) for index in range(6)
+        ]
+
+        index = client._find_alignment_index(
+            prepared,
+            ([5.0, 4.5], [5.0, 4.5]),
+            minimum_buffer_steps=4,
+        )
+
+        self.assertEqual(index, 2)
+        self.assertEqual(len(prepared[index:]), 4)
+
+    def test_rebase_releases_joint_offset_smoothly(self):
+        client = _make_client()
+
+        result = client._rebase_actions(
+            [[2.0, 4.5], [4.0, 4.5], [6.0, 0.0]],
+            reference=[0.0, 4.5],
+            correction_steps=3,
+        )
+
+        self.assertEqual([action[0] for action in result], [0.0, 3.0, 6.0])
+        self.assertEqual([action[-1] for action in result], [4.5, 4.5, 0.0])
+
+    def test_rebase_end_pose_starts_at_reference_and_keeps_target(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        actions = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(-179.0), 4.5],
+            [2.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(-178.0), 4.5],
+            [3.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(-177.0), 0.0],
+        ]
+        reference = [0.0, 0.0, 0.0, 0.0, 0.0, np.deg2rad(179.0), 4.5]
+
+        result = np.asarray(client._rebase_actions(actions, reference, 3))
+        rotations = transform.Rotation.from_euler("xyz", result[:, 3:6])
+        reference_rotation = transform.Rotation.from_euler("xyz", reference[3:6])
+        target_rotation = transform.Rotation.from_euler("xyz", actions[-1][3:6])
+
+        self.assertAlmostEqual(result[0, 0], reference[0])
+        self.assertAlmostEqual(result[-1, 0], actions[-1][0])
+        self.assertLess((reference_rotation.inv() * rotations[0]).magnitude(), 1e-8)
+        self.assertLess((target_rotation.inv() * rotations[-1]).magnitude(), 1e-8)
+        self.assertEqual(result[:, -1].tolist(), [4.5, 4.5, 0.0])
+
+    def test_request_queue_allows_one_request_per_worker(self):
+        client = _make_client()
+
+        self.assertTrue(client._request_prediction(control_step=0))
+        self.assertTrue(client._request_prediction(control_step=1))
+        self.assertFalse(client._request_prediction(control_step=2))
+        self.assertEqual(client._inference_in_flight, {1, 2})
+
+    def test_stale_worker_error_does_not_interrupt_newer_prediction(self):
+        client = _make_client()
+        client._last_applied_request_id = 2
+        client._inference_in_flight.add(1)
+        client._prediction_queue.put_nowait(
+            _PredictionChunk(
+                request=_InferenceRequest(request_id=1, control_step=0),
+                outputs=None,
+                left_anchor=None,
+                right_anchor=None,
+                started_at=1.0,
+                finished_at=1.2,
+                error=RuntimeError("stale failure"),
+            )
+        )
+
+        self.assertIsNone(client._poll_prediction())
+        self.assertNotIn(1, client._inference_in_flight)
 
     def test_gripper_deadband_suppresses_duplicate_rpc_calls(self):
         client = _make_client()

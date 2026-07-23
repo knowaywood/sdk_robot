@@ -10,6 +10,7 @@ from scipy.spatial import transform
 from x2robot.geometry_msgs import Point, Pose, Quaternion
 from x2robot.sdk import GripperPosition, JointPositions
 from x2robot_client.desktop_sdk_client import DesktopClient, logger
+from x2robot_client.inference_client import RobotClient
 from x2robot_client.sdk_utils import (
     crossfade_trajectories,
     interpolate_trajectory,
@@ -52,6 +53,7 @@ class AsyncDesktopClient(DesktopClient):
 
     GRIPPER_PHYSICAL_MAX = 4.5
     GRIPPER_HEARTBEAT_SECONDS = 1.0
+    INITIAL_INFERENCE_LATENCY_SECONDS = 1.2
 
     def __init__(
         self,
@@ -60,25 +62,32 @@ class AsyncDesktopClient(DesktopClient):
         prefetch_margin: float = 0.35,
         blend_duration: float = 0.3,
         gripper_deadband: float = 0.05,
+        inference_workers: int = 2,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
             raise ValueError("control_hz must be in the range (0, 200]")
         if prefetch_margin < 0 or blend_duration < 0 or gripper_deadband < 0:
             raise ValueError("pipeline timing and deadband values must be non-negative")
+        if inference_workers < 1 or inference_workers > 4:
+            raise ValueError("inference_workers must be in the range [1, 4]")
 
         self.control_period = 1.0 / control_hz
         self.prefetch_margin = prefetch_margin
         self.blend_steps = int(round(blend_duration / self.control_period))
         self.gripper_deadband = gripper_deadband
+        self.inference_workers = inference_workers
 
-        self._request_queue = queue.Queue(maxsize=1)
-        self._prediction_queue = queue.Queue(maxsize=1)
+        self._request_queue = queue.Queue(maxsize=inference_workers)
+        self._prediction_queue = queue.Queue(maxsize=2 * inference_workers)
         self._pipeline_stop = threading.Event()
-        self._inference_thread = None
-        self._inference_in_flight = False
+        self._inference_threads = []
+        self._inference_clients = []
+        self._sensor_lock = threading.Lock()
+        self._inference_in_flight = set()
         self._request_counter = 0
         self._discard_before_request_id = 0
+        self._last_applied_request_id = 0
         self._last_gripper_command = {"left": None, "right": None}
         self._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
 
@@ -102,14 +111,41 @@ class AsyncDesktopClient(DesktopClient):
         self._pipeline_stop.clear()
         self._drain_queue(self._request_queue)
         self._drain_queue(self._prediction_queue)
-        self._inference_in_flight = False
-        if self._inference_thread is None or not self._inference_thread.is_alive():
-            self._inference_thread = threading.Thread(
+        self._inference_in_flight.clear()
+
+        clients = [self.client]
+        metadata = getattr(self.client, "metadata", None) or {}
+        worker_limit = self.inference_workers
+        if worker_limit > 1 and not metadata.get("batch_enabled", False):
+            logger.warning(
+                "Model server does not advertise batch support; using one "
+                "inference worker"
+            )
+            worker_limit = 1
+
+        for worker_index in range(1, worker_limit):
+            try:
+                client = RobotClient(uri=self.uri)
+                client.connect_sync()
+                clients.append(client)
+            except Exception as exc:
+                logger.warning(
+                    f"Could not start inference worker {worker_index + 1}: {exc}; "
+                    f"continuing with {len(clients)} worker(s)"
+                )
+                break
+
+        self._inference_clients = clients
+        self._inference_threads = []
+        for worker_index, client in enumerate(clients, start=1):
+            thread = threading.Thread(
                 target=self._inference_worker,
-                name="desktop-inference-worker",
+                args=(client,),
+                name=f"desktop-inference-worker-{worker_index}",
                 daemon=True,
             )
-            self._inference_thread.start()
+            thread.start()
+            self._inference_threads.append(thread)
 
     def _put_latest_prediction(self, prediction: _PredictionChunk):
         try:
@@ -124,7 +160,22 @@ class AsyncDesktopClient(DesktopClient):
             pass
         self._prediction_queue.put_nowait(prediction)
 
-    def _inference_worker(self):
+    def _predict_with_retry(self, client: RobotClient, inputs: Dict) -> Dict:
+        for attempt in range(self.max_retries):
+            try:
+                outputs = client.predict_sync(inputs)
+                self._update_model_output_text(outputs)
+                return outputs
+            except Exception as exc:
+                logger.warning(
+                    f"Inference failed (attempt {attempt + 1}/{self.max_retries}): "
+                    f"{exc}"
+                )
+                if attempt < self.max_retries - 1:
+                    time.sleep(0.1)
+        raise RuntimeError(f"Model inference failed after {self.max_retries} attempts")
+
+    def _inference_worker(self, client: RobotClient):
         while not self._pipeline_stop.is_set():
             try:
                 request = self._request_queue.get(timeout=0.1)
@@ -133,10 +184,12 @@ class AsyncDesktopClient(DesktopClient):
 
             started_at = time.monotonic()
             try:
-                inputs = self._collect_sensor_data()
+                # Robot SDK sensor reads are serialized; model calls still overlap.
+                with self._sensor_lock:
+                    inputs = self._collect_sensor_data()
                 left_anchor = inputs["state"]["follow1_pos"].tolist()
                 right_anchor = inputs["state"]["follow2_pos"].tolist()
-                outputs = self._inference_with_retry(inputs)
+                outputs = self._predict_with_retry(client, inputs)
                 prediction = _PredictionChunk(
                     request=request,
                     outputs=outputs,
@@ -158,29 +211,32 @@ class AsyncDesktopClient(DesktopClient):
             self._put_latest_prediction(prediction)
 
     def _request_prediction(self, control_step: Optional[int]):
-        if self._inference_in_flight:
-            return
+        if len(self._inference_in_flight) >= len(self._inference_clients):
+            return False
         self._request_counter += 1
         request = _InferenceRequest(self._request_counter, control_step)
         try:
             self._request_queue.put_nowait(request)
         except queue.Full:
-            return
-        self._inference_in_flight = True
+            return False
+        self._inference_in_flight.add(request.request_id)
+        return True
 
     def _poll_prediction(self) -> Optional[_PredictionChunk]:
         try:
             prediction = self._prediction_queue.get_nowait()
         except queue.Empty:
             return None
-        self._inference_in_flight = False
-        if prediction.error is not None:
-            raise RuntimeError("Asynchronous inference failed") from prediction.error
-        if prediction.request.request_id <= self._discard_before_request_id:
+        self._inference_in_flight.discard(prediction.request.request_id)
+        if prediction.request.request_id <= max(
+            self._discard_before_request_id, self._last_applied_request_id
+        ):
             logger.info(
-                f"Discarding invalidated prediction #{prediction.request.request_id}"
+                f"Discarding stale prediction #{prediction.request.request_id}"
             )
             return None
+        if prediction.error is not None:
+            raise RuntimeError("Asynchronous inference failed") from prediction.error
         return prediction
 
     def _model_gripper_max(self) -> float:
@@ -239,6 +295,7 @@ class AsyncDesktopClient(DesktopClient):
         prediction: _PredictionChunk,
         last_command: Optional[Tuple[list, list]],
         active_actions: List[Tuple[list, list]],
+        minimum_buffer_steps: int = 0,
     ) -> List[Tuple[list, list]]:
         prepared = self._prepare_action_chunk(
             prediction.outputs,
@@ -249,8 +306,26 @@ class AsyncDesktopClient(DesktopClient):
             return []
 
         reference = active_actions[0] if active_actions else last_command
-        alignment_index = self._find_alignment_index(prepared, reference)
+        alignment_index = self._find_alignment_index(
+            prepared, reference, minimum_buffer_steps
+        )
         remaining = prepared[alignment_index:]
+        correction_steps = 0
+        if reference is not None and minimum_buffer_steps > 0:
+            correction_steps = min(
+                len(remaining), max(self.blend_steps, minimum_buffer_steps)
+            )
+            left_remaining = self._rebase_actions(
+                [pair[0] for pair in remaining],
+                reference[0],
+                correction_steps,
+            )
+            right_remaining = self._rebase_actions(
+                [pair[1] for pair in remaining],
+                reference[1],
+                correction_steps,
+            )
+            remaining = list(zip(left_remaining, right_remaining))
         if active_actions:
             left_actions = crossfade_trajectories(
                 [pair[0] for pair in active_actions],
@@ -289,19 +364,70 @@ class AsyncDesktopClient(DesktopClient):
             f"Prediction #{prediction.request.request_id}: "
             f"latency={prediction.latency:.3f}s, aligned={alignment_index}, "
             f"crossfade={overlap_steps}, "
+            f"correction={correction_steps}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
         return list(zip(left_actions, right_actions))
+
+    def _rebase_actions(
+        self,
+        actions: List[list],
+        reference: list,
+        correction_steps: int,
+    ) -> List[list]:
+        """Start at the current state and gradually return to the model path."""
+        if not actions or correction_steps <= 0:
+            return [list(action) for action in actions]
+
+        corrected = np.asarray(actions, dtype=float).copy()
+        reference_array = np.asarray(reference, dtype=float)
+        steps = min(len(corrected), correction_steps)
+        denominator = max(1, steps - 1)
+
+        if self.control_mode == "end_pose":
+            position_offset = reference_array[:3] - corrected[0, :3]
+            reference_rotation = transform.Rotation.from_euler(
+                "xyz", reference_array[3:6]
+            )
+            initial_rotation = transform.Rotation.from_euler(
+                "xyz", corrected[0, 3:6]
+            )
+            rotation_offset = reference_rotation * initial_rotation.inv()
+        else:
+            joint_offset = reference_array[:-1] - corrected[0, :-1]
+
+        for index in range(steps):
+            progress = index / denominator
+            released = 10 * progress**3 - 15 * progress**4 + 6 * progress**5
+            correction_weight = 1.0 - released
+
+            if self.control_mode == "end_pose":
+                corrected[index, :3] += correction_weight * position_offset
+
+                target_rotation = transform.Rotation.from_euler(
+                    "xyz", corrected[index, 3:6]
+                )
+                weighted_offset = transform.Rotation.from_rotvec(
+                    correction_weight * rotation_offset.as_rotvec()
+                )
+                corrected[index, 3:6] = (
+                    weighted_offset * target_rotation
+                ).as_euler("xyz")
+            else:
+                corrected[index, :-1] += correction_weight * joint_offset
+
+        return corrected.tolist()
 
     def _find_alignment_index(
         self,
         prepared: List[Tuple[list, list]],
         reference: Optional[Tuple[list, list]],
+        minimum_buffer_steps: int = 0,
     ) -> int:
         if reference is None or len(prepared) <= 1:
             return 0
 
-        minimum_remaining = max(1, self.blend_steps)
+        minimum_remaining = max(1, self.blend_steps, minimum_buffer_steps)
         candidate_count = max(1, len(prepared) - minimum_remaining + 1)
         left = np.asarray([pair[0] for pair in prepared[:candidate_count]])
         right = np.asarray([pair[1] for pair in prepared[:candidate_count]])
@@ -413,24 +539,26 @@ class AsyncDesktopClient(DesktopClient):
         )
 
     def execute_model(self) -> None:
-        """Run inference and robot control concurrently using a latest-only buffer."""
+        """Run staggered inference and receding-horizon robot control."""
         logger.info("Starting asynchronous model execution loop...")
+        self._start_inference_worker()
+        worker_count = len(self._inference_clients)
         logger.info(
             f"Pipeline config: control_hz={1.0 / self.control_period:.1f}, "
             f"interpolate_multiplier={self.interpolate_multiplier}, "
             f"raw_action_interval="
             f"{self.interpolate_multiplier * self.control_period:.4f}s, "
             f"prefetch_margin={self.prefetch_margin:.3f}s, "
-            f"blend={self.blend_steps * self.control_period:.3f}s"
+            f"blend={self.blend_steps * self.control_period:.3f}s, "
+            f"inference_workers={worker_count}"
         )
-        self._start_inference_worker()
 
         active_actions = deque()
         latency_history = deque(maxlen=20)
         last_command = None
-        pending_prediction = None
         control_step = 0
         next_tick = time.monotonic()
+        last_request_at = next_tick
         last_underflow_log = 0.0
         last_stats_log = next_tick
         deadline_misses = 0
@@ -441,7 +569,6 @@ class AsyncDesktopClient(DesktopClient):
             while not self.action_terminator:
                 if self.remote_control:
                     active_actions.clear()
-                    pending_prediction = None
                     self._discard_before_request_id = self._request_counter
                     prediction = self._poll_prediction()
                     if prediction is not None:
@@ -460,37 +587,40 @@ class AsyncDesktopClient(DesktopClient):
                 prediction = self._poll_prediction()
                 if prediction is not None:
                     latency_history.append(prediction.latency)
-                    pending_prediction = prediction
-
-                if pending_prediction is not None and (
-                    not active_actions or len(active_actions) <= self.blend_steps
-                ):
+                    inference_p95 = float(np.percentile(latency_history, 95))
+                    result_interval = inference_p95 / worker_count
+                    minimum_buffer_steps = int(
+                        np.ceil(
+                            (result_interval + self.prefetch_margin)
+                            / self.control_period
+                        )
+                    )
                     replacement = self._stitch_prediction(
-                        pending_prediction, last_command, list(active_actions)
+                        prediction,
+                        last_command,
+                        list(active_actions),
+                        minimum_buffer_steps,
                     )
                     if replacement:
                         active_actions = deque(replacement)
-                    pending_prediction = None
+                        self._last_applied_request_id = prediction.request.request_id
 
                 inference_p95 = (
                     float(np.percentile(latency_history, 95))
                     if latency_history
-                    else 0.5
+                    else self.INITIAL_INFERENCE_LATENCY_SECONDS
                 )
-                prefetch_steps = max(
-                    1,
-                    int(
-                        np.ceil(
-                            (inference_p95 + self.prefetch_margin)
-                            / self.control_period
-                        )
-                    ),
+                request_interval = max(
+                    self.control_period,
+                    inference_p95 / worker_count,
                 )
-                if pending_prediction is None and not self._inference_in_flight and (
-                    not active_actions or len(active_actions) <= prefetch_steps
+                if (
+                    len(self._inference_in_flight) < worker_count
+                    and now - last_request_at >= request_interval
                 ):
                     request_step = control_step if active_actions else None
-                    self._request_prediction(request_step)
+                    if self._request_prediction(request_step):
+                        last_request_at = now
 
                 if active_actions:
                     left_action, right_action = active_actions.popleft()
@@ -515,6 +645,8 @@ class AsyncDesktopClient(DesktopClient):
                         f"Pipeline: buffer={len(active_actions)} "
                         f"({len(active_actions) * self.control_period:.3f}s), "
                         f"infer_p95={inference_p95:.3f}s, "
+                        f"result_interval={request_interval:.3f}s, "
+                        f"in_flight={len(self._inference_in_flight)}, "
                         f"command_p95={command_p95:.4f}s, "
                         f"deadline_misses={deadline_misses}"
                     )
