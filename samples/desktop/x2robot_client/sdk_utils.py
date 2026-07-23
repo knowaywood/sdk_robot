@@ -140,6 +140,44 @@ def stitch_trajectory(
     return transition[1:] + remaining[1:]
 
 
+def crossfade_trajectories(
+    existing_actions: list,
+    predicted_actions: list,
+    blend_steps: int,
+    mode: str = "end_pose",
+) -> list:
+    """Blend an existing trajectory into a replacement without a velocity step."""
+    if not predicted_actions:
+        return []
+    if not existing_actions or blend_steps <= 0:
+        return [list(action) for action in predicted_actions]
+
+    overlap = min(len(existing_actions), len(predicted_actions), int(blend_steps))
+    blended = []
+    for index in range(overlap):
+        old = np.asarray(existing_actions[index], dtype=float)
+        new = np.asarray(predicted_actions[index], dtype=float)
+        progress = (index + 1) / overlap
+        weight = 10 * progress**3 - 15 * progress**4 + 6 * progress**5
+        action = (1.0 - weight) * old + weight * new
+
+        if mode == "end_pose" and len(action) >= 6:
+            old_quat = transform.Rotation.from_euler("xyz", old[3:6]).as_quat()
+            new_quat = transform.Rotation.from_euler("xyz", new[3:6]).as_quat()
+            if np.dot(old_quat, new_quat) < 0:
+                new_quat = -new_quat
+            quat = (1.0 - weight) * old_quat + weight * new_quat
+            quat /= max(np.linalg.norm(quat), np.finfo(float).eps)
+            action[3:6] = transform.Rotation.from_quat(quat).as_euler("xyz")
+
+        # Gripper remains event-based during the overlap.
+        action[-1] = new[-1] if index == overlap - 1 else old[-1]
+        blended.append(action.tolist())
+
+    blended.extend([list(action) for action in predicted_actions[overlap:]])
+    return blended
+
+
 def smoothen(
     arr: np.ndarray, window: int = None, poly: int = 2, ema_alpha: float = 0.25
 ) -> np.ndarray:

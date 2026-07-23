@@ -8,6 +8,7 @@ from x2robot_client.async_desktop_sdk_client import (
     AsyncDesktopClient,
     _InferenceRequest,
     _PredictionChunk,
+    _next_control_deadline,
 )
 
 
@@ -31,6 +32,15 @@ def _make_client():
 
 
 class AsyncPipelineTest(unittest.TestCase):
+    def test_control_deadline_never_catches_up_with_a_burst(self):
+        next_tick, missed = _next_control_deadline(1.0, 1.015, 0.01)
+        self.assertTrue(missed)
+        self.assertAlmostEqual(next_tick, 1.025)
+
+        next_tick, missed = _next_control_deadline(2.0, 2.004, 0.01)
+        self.assertFalse(missed)
+        self.assertAlmostEqual(next_tick, 2.01)
+
     def test_prediction_skips_steps_executed_while_inference_was_running(self):
         client = _make_client()
         request = _InferenceRequest(request_id=1, control_step=10)
@@ -50,6 +60,7 @@ class AsyncPipelineTest(unittest.TestCase):
             prediction,
             control_step=12,
             last_command=([-1.0, 4.5], [-1.0, 4.5]),
+            active_actions=[],
         )
 
         self.assertEqual([pair[0][0] for pair in result], [0.0, 1.0, 1.5, 2.0])

@@ -6,7 +6,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from x2robot_client.sdk_utils import interpolate_trajectory, stitch_trajectory
+from x2robot_client.sdk_utils import (
+    crossfade_trajectories,
+    interpolate_trajectory,
+    stitch_trajectory,
+)
 
 
 class InterpolateTrajectoryTest(unittest.TestCase):
@@ -87,6 +91,21 @@ class StitchTrajectoryTest(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+
+
+class CrossfadeTrajectoriesTest(unittest.TestCase):
+    def test_uses_minimum_jerk_weights_and_preserves_gripper_event(self):
+        existing = [[0.0, 4.5], [1.0, 4.5], [2.0, 4.5], [3.0, 4.5]]
+        predicted = [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]]
+
+        result = np.asarray(
+            crossfade_trajectories(existing, predicted, 4, mode="joints")
+        )
+
+        np.testing.assert_allclose(
+            result[:, 0], [0.0, 1.5, 3.79296875, 6.0]
+        )
+        np.testing.assert_allclose(result[:, -1], [4.5, 4.5, 4.5, 0.0])
 
 
 if __name__ == "__main__":
