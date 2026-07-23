@@ -13,6 +13,9 @@ def main(args):
         camera_history_k=args.camera_history_k,
         camera_capture_hz=args.camera_capture_hz,
         interpolate_multiplier=args.interpolate_multiplier,
+        model_action_hz=args.model_action_hz,
+        exec_hz=args.exec_hz,
+        overlap_model_steps=args.overlap_model_steps,
         debug_step=args.debug_step,
         robot_sdk_url=args.robot_sdk_url,
     )
@@ -34,7 +37,10 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8000, help="Model server port")
 
     parser.add_argument(
-        "--instruction", type=str, default="Pick up the green cup and place it on the tray.", help="Text instruction for the model"
+        "--instruction",
+        type=str,
+        default="Pick up the green cup and place it on the tray.",
+        help="Text instruction for the model",
     )
 
     parser.add_argument(
@@ -59,8 +65,32 @@ def parse_args():
     parser.add_argument(
         "--interpolate-multiplier",
         type=int,
-        default=20,
-        help="Interpolate multiplier for action execution",
+        default=0,
+        help=(
+            "Deprecated compatibility option; ignored by the asynchronous "
+            "time-based resampler"
+        ),
+    )
+
+    parser.add_argument(
+        "--model-action-hz",
+        type=float,
+        default=30.0,
+        help="Temporal frequency represented by raw model action steps",
+    )
+
+    parser.add_argument(
+        "--exec-hz",
+        type=float,
+        default=50.0,
+        help="Target robot action command frequency",
+    )
+
+    parser.add_argument(
+        "--overlap-model-steps",
+        type=int,
+        default=4,
+        help="Number of raw model steps used for delay-aligned chunk crossfade",
     )
 
     parser.add_argument(

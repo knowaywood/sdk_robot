@@ -94,9 +94,20 @@ class RobotClientBase(ABC):
         pass
 
     @abstractmethod
-    def _execute_actions(self, outputs: Dict[str, Any]) -> None:
+    def _execute_actions(
+        self, outputs: Dict[str, Any], inference_context: Any = None
+    ) -> None:
         """Execute actions based on model outputs."""
         pass
+
+    def _capture_inference_context(self) -> Any:
+        """Capture state needed to align a future inference response.
+
+        Subclasses with asynchronous action execution can override this hook.
+        It is called immediately before sensor collection so response alignment
+        includes both observation acquisition and model inference latency.
+        """
+        return None
 
     def get_model_output_text(self) -> None:
         """return model output text"""
@@ -117,19 +128,20 @@ class RobotClientBase(ABC):
                     time.sleep(0.1)
                 else:
                     # 1. Collect sensor data
-                    st_time_1 = time.time()
+                    inference_context = self._capture_inference_context()
+                    st_time_1 = time.monotonic()
                     sensor_data = self._collect_sensor_data()
-                    ed_time_1 = time.time()
+                    ed_time_1 = time.monotonic()
 
                     # 2. Inference
-                    st_time_2 = time.time()
+                    st_time_2 = time.monotonic()
                     outputs = self._inference_with_retry(sensor_data)
-                    ed_time_2 = time.time()
+                    ed_time_2 = time.monotonic()
 
                     # 3. Execute actions
-                    st_time_3 = time.time()
-                    self._execute_actions(outputs)
-                    ed_time_3 = time.time()
+                    st_time_3 = time.monotonic()
+                    self._execute_actions(outputs, inference_context)
+                    ed_time_3 = time.monotonic()
 
                     logger.info(
                         f"Data: {ed_time_1 - st_time_1:.4f}s, "

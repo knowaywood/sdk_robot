@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from scipy.spatial import transform
+from scipy.spatial.transform import Slerp
 from x2robot.sensor_msgs import CompressedImage
 
 
@@ -108,6 +109,119 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
             )
 
     return interpolated_actions.tolist()
+
+
+def _validate_trajectory(actions: list) -> np.ndarray:
+    """Convert an action trajectory to a finite 2-D float array."""
+    actions_np = np.asarray(actions, dtype=np.float64)
+    if actions_np.ndim != 2 or actions_np.shape[0] == 0:
+        raise ValueError("actions must be a non-empty 2-D trajectory")
+    if not np.isfinite(actions_np).all():
+        raise ValueError("actions contain NaN or infinity")
+    return actions_np
+
+
+def _zero_order_hold(values: np.ndarray, source_times, target_times) -> np.ndarray:
+    """Resample event-like values without creating intermediate commands."""
+    indices = np.searchsorted(source_times, target_times, side="right") - 1
+    indices = np.clip(indices, 0, len(source_times) - 1)
+    return values[indices]
+
+
+def resample_trajectory(
+    actions: list,
+    source_hz: float,
+    target_hz: float,
+    mode: str = "end_pose",
+) -> list:
+    """Resample a model trajectory onto the robot execution time grid.
+
+    Position and joint channels are linearly interpolated. End-effector
+    orientation is interpolated on SO(3) with Slerp. The last channel is
+    treated as the gripper command and uses zero-order hold so resampling does
+    not create unintended intermediate opening/closing commands.
+    """
+    if source_hz <= 0 or target_hz <= 0:
+        raise ValueError("source_hz and target_hz must be positive")
+
+    actions_np = _validate_trajectory(actions)
+    num_actions, action_dim = actions_np.shape
+    if num_actions == 1:
+        return actions_np.tolist()
+
+    source_times = np.arange(num_actions, dtype=np.float64) / float(source_hz)
+    duration = source_times[-1]
+    target_count = max(2, int(round(duration * float(target_hz))) + 1)
+    target_times = np.linspace(0.0, duration, target_count, dtype=np.float64)
+    output = np.empty((target_count, action_dim), dtype=np.float64)
+
+    if mode == "end_pose":
+        if action_dim < 7:
+            raise ValueError(
+                "end_pose actions must contain [x, y, z, roll, pitch, yaw, gripper]"
+            )
+
+        for dim in range(3):
+            output[:, dim] = np.interp(
+                target_times, source_times, actions_np[:, dim]
+            )
+
+        rotations = transform.Rotation.from_euler("xyz", actions_np[:, 3:6])
+        output[:, 3:6] = Slerp(source_times, rotations)(target_times).as_euler(
+            "xyz"
+        )
+
+        # Preserve any extra continuous channels between orientation and grip.
+        for dim in range(6, action_dim - 1):
+            output[:, dim] = np.interp(
+                target_times, source_times, actions_np[:, dim]
+            )
+    else:
+        for dim in range(action_dim - 1):
+            output[:, dim] = np.interp(
+                target_times, source_times, actions_np[:, dim]
+            )
+
+    output[:, -1] = _zero_order_hold(
+        actions_np[:, -1], source_times, target_times
+    )
+    return output.tolist()
+
+
+def blend_action_pair(old_action, new_action, alpha: float, mode: str):
+    """Blend motion channels while keeping the old gripper command.
+
+    The caller switches to the new gripper command only when the overlap is
+    complete. This prevents chunk stitching from inventing intermediate grip
+    values.
+    """
+    old = np.asarray(old_action, dtype=np.float64)
+    new = np.asarray(new_action, dtype=np.float64)
+    if old.shape != new.shape or old.ndim != 1:
+        raise ValueError("old_action and new_action must be equal-size vectors")
+    if not np.isfinite(old).all() or not np.isfinite(new).all():
+        raise ValueError("actions contain NaN or infinity")
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    blended = old.copy()
+    if mode == "end_pose":
+        if old.size < 7:
+            raise ValueError(
+                "end_pose actions must contain [x, y, z, roll, pitch, yaw, gripper]"
+            )
+        blended[:3] = (1.0 - alpha) * old[:3] + alpha * new[:3]
+        rotations = transform.Rotation.from_euler(
+            "xyz", np.stack([old[3:6], new[3:6]])
+        )
+        blended[3:6] = Slerp([0.0, 1.0], rotations)([alpha]).as_euler("xyz")[0]
+        if old.size > 7:
+            blended[6:-1] = (1.0 - alpha) * old[6:-1] + alpha * new[6:-1]
+    else:
+        blended[:-1] = (1.0 - alpha) * old[:-1] + alpha * new[:-1]
+
+    # Do not blend the gripper. Change it only at the end of the overlap.
+    blended[-1] = new[-1] if alpha >= 1.0 else old[-1]
+    return blended.tolist()
 
 
 def smoothen(
