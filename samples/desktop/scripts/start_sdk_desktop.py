@@ -25,6 +25,7 @@ def main(args):
         gripper_release_confirm=args.gripper_release_confirm,
         gripper_reopen_dwell=args.gripper_reopen_dwell,
         gripper_release_travel=args.gripper_release_travel,
+        gripper_approach_travel=args.gripper_approach_travel,
         gripper_transition_linear_speed=args.gripper_transition_linear_speed,
         gripper_transition_angular_speed=args.gripper_transition_angular_speed,
         max_linear_speed=args.max_linear_speed,
@@ -147,6 +148,13 @@ def parse_args():
         type=float,
         default=0.05,
         help="Minimum Cartesian travel after grasp before release is allowed",
+    )
+
+    parser.add_argument(
+        "--gripper-approach-travel",
+        type=float,
+        default=0.03,
+        help="Minimum Cartesian travel after opening before grasp is allowed",
     )
 
     parser.add_argument(

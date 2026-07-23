@@ -47,6 +47,7 @@ def _make_client():
     client.gripper_release_confirm = 0.4
     client.gripper_reopen_dwell = 1.0
     client.gripper_release_travel = 0.05
+    client.gripper_approach_travel = 0.03
     client.gripper_transition_linear_speed = 0.08
     client.gripper_transition_angular_speed = 0.6
     client.GRIPPER_DATA_MAX = 4.5
@@ -54,7 +55,8 @@ def _make_client():
     client._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
     client._gripper_transition_candidate = {"left": None, "right": None}
     client._gripper_closed_pose = {"left": None, "right": None}
-    client._gripper_block_counts = {"motion": 0, "travel": 0}
+    client._gripper_open_pose = {"left": None, "right": None}
+    client._gripper_block_counts = {"motion": 0, "approach": 0, "travel": 0}
     return client
 
 
@@ -237,6 +239,35 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertAlmostEqual(inputs["state"]["follow1_gripper"], 1.55)
         self.assertAlmostEqual(inputs["state"]["follow2_gripper"], 0.775)
 
+    def test_unloaded_gripper_is_preopened_before_planned_approach(self):
+        client = _make_client()
+        client.GRIPPER_DATA_MAX = 1.55
+        client._last_gripper_command["right"] = 0.0
+        actions = [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 1.55],
+            [3.0, 0.0],
+        ]
+
+        preopened = client._preopen_unloaded_gripper("right", actions)
+
+        self.assertTrue(preopened)
+        self.assertEqual(
+            [action[-1] for action in actions], [1.55, 1.55, 1.55, 0.0]
+        )
+
+    def test_grasped_gripper_is_not_preopened(self):
+        client = _make_client()
+        client._last_gripper_command["right"] = 0.0
+        client._gripper_closed_pose["right"] = np.zeros(3)
+        actions = [[0.0, 0.0], [1.0, 4.5]]
+
+        preopened = client._preopen_unloaded_gripper("right", actions)
+
+        self.assertFalse(preopened)
+        self.assertEqual([action[-1] for action in actions], [0.0, 4.5])
+
     def test_plan_summary_reports_next_gripper_event(self):
         client = _make_client()
         client.control_mode = "end_pose"
@@ -262,6 +293,7 @@ class AsyncPipelineTest(unittest.TestCase):
         gripper = _RecordingGripper()
         client._last_gripper_command["left"] = 0.0
         client._last_gripper_sent_at["left"] = 1.0
+        client._gripper_closed_pose["left"] = np.zeros(3)
 
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.2)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.45)
@@ -271,6 +303,27 @@ class AsyncPipelineTest(unittest.TestCase):
 
         self.assertEqual(gripper.positions, [4.5, 4.5])
 
+    def test_unloaded_preopen_is_not_blocked_by_arm_motion_or_release_dwell(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        gripper = _RecordingGripper()
+        client._last_gripper_command["right"] = 0.0
+        client._last_gripper_sent_at["right"] = 1.0
+        moving = [0.04, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5]
+        previous = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5]
+
+        client._send_gripper_if_needed(
+            "right", gripper, 4.5, now=1.05,
+            arm_action=moving, previous_arm_action=previous,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 4.5, now=1.25,
+            arm_action=moving, previous_arm_action=previous,
+        )
+
+        self.assertEqual(gripper.positions, [4.5])
+        self.assertEqual(client._gripper_block_counts["motion"], 0)
+
     def test_gripper_close_waits_for_stable_request_and_low_arm_speed(self):
         client = _make_client()
         client.control_mode = "end_pose"
@@ -279,6 +332,7 @@ class AsyncPipelineTest(unittest.TestCase):
         client._last_gripper_sent_at["right"] = 1.0
         moving = [0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         previous = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5]
+        settled = [0.06, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
         client._send_gripper_if_needed(
             "right", gripper, 0.5, now=1.1,
@@ -290,10 +344,36 @@ class AsyncPipelineTest(unittest.TestCase):
         )
         client._send_gripper_if_needed(
             "right", gripper, 0.5, now=1.4,
-            arm_action=moving, previous_arm_action=moving,
+            arm_action=settled, previous_arm_action=settled,
         )
 
         self.assertEqual(gripper.positions, [0.0])
+
+    def test_gripper_close_requires_approach_travel_after_opening(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        gripper = _RecordingGripper()
+        client._last_gripper_command["right"] = 4.5
+        client._last_gripper_sent_at["right"] = 1.0
+        client._gripper_open_pose["right"] = np.zeros(3)
+        too_near = [0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        approached = [0.04, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        client._send_gripper_if_needed(
+            "right", gripper, 0.0, now=1.0,
+            arm_action=too_near, previous_arm_action=too_near,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 0.0, now=1.2,
+            arm_action=too_near, previous_arm_action=too_near,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 0.0, now=1.3,
+            arm_action=approached, previous_arm_action=approached,
+        )
+
+        self.assertEqual(gripper.positions, [0.0])
+        self.assertEqual(client._gripper_block_counts["approach"], 1)
 
     def test_gripper_release_noise_does_not_open_gripper(self):
         client = _make_client()

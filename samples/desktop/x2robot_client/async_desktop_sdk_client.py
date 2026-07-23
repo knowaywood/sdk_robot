@@ -71,6 +71,7 @@ class AsyncDesktopClient(DesktopClient):
         gripper_release_confirm: float = 0.4,
         gripper_reopen_dwell: float = 1.0,
         gripper_release_travel: float = 0.05,
+        gripper_approach_travel: float = 0.03,
         gripper_transition_linear_speed: float = 0.08,
         gripper_transition_angular_speed: float = 0.6,
         max_linear_speed: float = 0.3,
@@ -90,6 +91,7 @@ class AsyncDesktopClient(DesktopClient):
             or gripper_release_confirm < 0
             or gripper_reopen_dwell < 0
             or gripper_release_travel < 0
+            or gripper_approach_travel < 0
             or gripper_transition_linear_speed <= 0
             or gripper_transition_angular_speed <= 0
             or max_linear_speed <= 0
@@ -111,6 +113,7 @@ class AsyncDesktopClient(DesktopClient):
         self.gripper_release_confirm = gripper_release_confirm
         self.gripper_reopen_dwell = gripper_reopen_dwell
         self.gripper_release_travel = gripper_release_travel
+        self.gripper_approach_travel = gripper_approach_travel
         self.gripper_transition_linear_speed = gripper_transition_linear_speed
         self.gripper_transition_angular_speed = gripper_transition_angular_speed
         self.max_linear_speed = max_linear_speed
@@ -131,7 +134,12 @@ class AsyncDesktopClient(DesktopClient):
         self._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
         self._gripper_transition_candidate = {"left": None, "right": None}
         self._gripper_closed_pose = {"left": None, "right": None}
-        self._gripper_block_counts = {"motion": 0, "travel": 0}
+        self._gripper_open_pose = {"left": None, "right": None}
+        self._gripper_block_counts = {
+            "motion": 0,
+            "approach": 0,
+            "travel": 0,
+        }
         self._motion_limit_count = 0
 
         super().__init__(*args, **kwargs)
@@ -210,6 +218,7 @@ class AsyncDesktopClient(DesktopClient):
             self._last_gripper_sent_at[side] = now
             self._gripper_transition_candidate[side] = None
             self._gripper_closed_pose[side] = None
+            self._gripper_open_pose[side] = None
             logger.info(
                 f"Gripper {side}: initialized as "
                 f"{'open' if logical > 0 else 'closed'} "
@@ -360,6 +369,26 @@ class AsyncDesktopClient(DesktopClient):
             actions = actions.tolist()
         return [list(action) for action in actions]
 
+    def _preopen_unloaded_gripper(self, side: str, actions: list) -> bool:
+        if (
+            self._last_gripper_command[side] != 0.0
+            or self._gripper_closed_pose[side] is not None
+        ):
+            return False
+
+        first_open = None
+        for index, action in enumerate(actions):
+            physical = self._gripper_to_physical_range(float(action[-1]))
+            if physical >= self.GRIPPER_OPEN_THRESHOLD:
+                first_open = index
+                break
+        if first_open is None:
+            return False
+
+        for action in actions[: first_open + 1]:
+            action[-1] = self._model_gripper_max()
+        return True
+
     def _prepare_action_chunk(
         self,
         outputs: Dict,
@@ -371,12 +400,19 @@ class AsyncDesktopClient(DesktopClient):
         if not left_actions or not right_actions:
             return []
 
+        left_preopen = self._preopen_unloaded_gripper("left", left_actions)
+        right_preopen = self._preopen_unloaded_gripper("right", right_actions)
+
         if self.interpolate_multiplier > 1:
             left_anchor = self._anchor_to_model_range(left_anchor)
             right_anchor = self._anchor_to_model_range(right_anchor)
             if left_anchor is not None:
+                if left_preopen:
+                    left_anchor[-1] = self._model_gripper_max()
                 left_actions.insert(0, left_anchor)
             if right_anchor is not None:
+                if right_preopen:
+                    right_anchor[-1] = self._model_gripper_max()
                 right_actions.insert(0, right_anchor)
 
         left_actions = interpolate_trajectory(
@@ -706,11 +742,27 @@ class AsyncDesktopClient(DesktopClient):
             return
 
         previous = self._last_gripper_command[side]
+        if (
+            previous is not None
+            and previous > 0.0
+            and self._gripper_open_pose[side] is None
+            and self.control_mode == "end_pose"
+            and arm_action is not None
+        ):
+            self._gripper_open_pose[side] = np.asarray(
+                arm_action[:3], dtype=float
+            )
+
         is_transition = (
             previous is not None
             and abs(position - previous) >= self.gripper_deadband
         )
         if is_transition:
+            unloaded_preopen = (
+                position > 0.0
+                and previous == 0.0
+                and self._gripper_closed_pose[side] is None
+            )
             candidate = self._gripper_transition_candidate[side]
             if candidate is None or candidate[0] != position:
                 self._gripper_transition_candidate[side] = (position, now)
@@ -718,7 +770,7 @@ class AsyncDesktopClient(DesktopClient):
 
             confirmation = (
                 self.gripper_close_confirm
-                if position == 0.0
+                if position == 0.0 or unloaded_preopen
                 else self.gripper_release_confirm
             )
             if now - candidate[1] < confirmation:
@@ -728,13 +780,29 @@ class AsyncDesktopClient(DesktopClient):
                 arm_action, previous_arm_action
             )
             if (
-                linear_speed > self.gripper_transition_linear_speed
-                or angular_speed > self.gripper_transition_angular_speed
+                not unloaded_preopen
+                and (
+                    linear_speed > self.gripper_transition_linear_speed
+                    or angular_speed > self.gripper_transition_angular_speed
+                )
             ):
                 self._gripper_block_counts["motion"] += 1
                 return
 
-            if position > 0.0:
+            if position == 0.0:
+                open_pose = self._gripper_open_pose[side]
+                if (
+                    self.control_mode == "end_pose"
+                    and open_pose is not None
+                    and arm_action is not None
+                ):
+                    approach_travel = np.linalg.norm(
+                        np.asarray(arm_action[:3], dtype=float) - open_pose
+                    )
+                    if approach_travel < self.gripper_approach_travel:
+                        self._gripper_block_counts["approach"] += 1
+                        return
+            elif not unloaded_preopen:
                 if (
                     now - self._last_gripper_sent_at[side]
                     < self.gripper_reopen_dwell
@@ -785,8 +853,13 @@ class AsyncDesktopClient(DesktopClient):
                 self._gripper_closed_pose[side] = np.asarray(
                     arm_action[:3], dtype=float
                 )
+                self._gripper_open_pose[side] = None
             elif state_changed and position > 0.0:
                 self._gripper_closed_pose[side] = None
+                if self.control_mode == "end_pose" and arm_action is not None:
+                    self._gripper_open_pose[side] = np.asarray(
+                        arm_action[:3], dtype=float
+                    )
 
     def _gripper_to_physical_range(self, value: float) -> float:
         scaled = value / self._model_gripper_max() * self.GRIPPER_PHYSICAL_MAX
@@ -921,6 +994,7 @@ class AsyncDesktopClient(DesktopClient):
             f"inference_workers={worker_count}, "
             f"gripper_close_confirm={self.gripper_close_confirm:.2f}s, "
             f"gripper_release_confirm={self.gripper_release_confirm:.2f}s, "
+            f"gripper_approach_travel={self.gripper_approach_travel:.3f}m, "
             f"gripper_release_travel={self.gripper_release_travel:.3f}m, "
             f"max_linear_speed={self.max_linear_speed:.2f}m/s, "
             f"max_angular_speed={self.max_angular_speed:.2f}rad/s"
@@ -1029,8 +1103,9 @@ class AsyncDesktopClient(DesktopClient):
                         f"result_interval={request_interval:.3f}s, "
                         f"in_flight={len(self._inference_in_flight)}, "
                         f"motion_limits={self._motion_limit_count}, "
-                        f"gripper_blocks="
+                        f"gripper_blocks(motion/approach/release)="
                         f"{self._gripper_block_counts['motion']}/"
+                        f"{self._gripper_block_counts['approach']}/"
                         f"{self._gripper_block_counts['travel']}, "
                         f"command_p95={command_p95:.4f}s, "
                         f"deadline_misses={deadline_misses}"
