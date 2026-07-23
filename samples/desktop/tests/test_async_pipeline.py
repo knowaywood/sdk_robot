@@ -42,12 +42,18 @@ def _make_client():
     client._discard_before_request_id = 0
     client._last_applied_request_id = 0
     client.gripper_deadband = 0.05
-    client.gripper_release_confirm = 0.2
-    client.gripper_reopen_dwell = 0.6
+    client.gripper_close_confirm = 0.15
+    client.gripper_release_confirm = 0.4
+    client.gripper_reopen_dwell = 1.0
+    client.gripper_release_travel = 0.05
+    client.gripper_transition_linear_speed = 0.08
+    client.gripper_transition_angular_speed = 0.6
     client.GRIPPER_DATA_MAX = 4.5
     client._last_gripper_command = {"left": None, "right": None}
     client._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
-    client._gripper_release_candidate = {"left": None, "right": None}
+    client._gripper_transition_candidate = {"left": None, "right": None}
+    client._gripper_closed_pose = {"left": None, "right": None}
+    client._gripper_block_counts = {"motion": 0, "travel": 0}
     return client
 
 
@@ -61,7 +67,7 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertFalse(missed)
         self.assertAlmostEqual(next_tick, 2.01)
 
-    def test_prediction_aligns_to_current_state_without_time_based_skip(self):
+    def test_prediction_skips_actions_executed_during_inference(self):
         client = _make_client()
         request = _InferenceRequest(request_id=1, control_step=10)
         prediction = _PredictionChunk(
@@ -78,47 +84,38 @@ class AsyncPipelineTest(unittest.TestCase):
 
         result = client._stitch_prediction(
             prediction,
+            control_step=12,
             last_command=([-1.0, 4.5], [-1.0, 4.5]),
             active_actions=[],
         )
 
+        self.assertEqual([pair[0][0] for pair in result], [-1.0, 0.5, 2.0])
         self.assertEqual(
-            [pair[0][0] for pair in result], [-0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
-        )
-        self.assertEqual(
-            [pair[0][-1] for pair in result],
-            [4.5, 4.5, 4.5, 4.5, 4.5, 0.0],
+            [pair[0][-1] for pair in result], [4.5, 4.5, 0.0]
         )
 
-    def test_alignment_uses_nearest_dual_arm_state_instead_of_elapsed_time(self):
+    def test_prediction_is_discarded_when_latency_exceeds_action_horizon(self):
         client = _make_client()
-        prepared = [
-            ([0.0, 4.5], [0.0, 4.5]),
-            ([1.0, 4.5], [1.0, 4.5]),
-            ([2.0, 4.5], [2.0, 4.5]),
-            ([3.0, 4.5], [3.0, 4.5]),
-        ]
-
-        index = client._find_alignment_index(
-            prepared, ([1.1, 4.5], [0.9, 4.5])
+        prediction = _PredictionChunk(
+            request=_InferenceRequest(request_id=1, control_step=10),
+            outputs={
+                "follow1_pos": [[1.0, 4.5], [2.0, 0.0]],
+                "follow2_pos": [[1.0, 4.5], [2.0, 0.0]],
+            },
+            left_anchor=[0.0, 4.5],
+            right_anchor=[0.0, 4.5],
+            started_at=1.0,
+            finished_at=2.0,
         )
 
-        self.assertEqual(index, 1)
-
-    def test_alignment_keeps_enough_actions_for_next_prediction(self):
-        client = _make_client()
-        prepared = [
-            ([float(index), 4.5], [float(index), 4.5]) for index in range(6)
-        ]
-
-        index = client._find_alignment_index(
-            prepared,
-            ([5.0, 4.5], [5.0, 4.5]),
-            minimum_buffer_steps=4,
+        result = client._stitch_prediction(
+            prediction,
+            control_step=20,
+            last_command=([0.0, 4.5], [0.0, 4.5]),
+            active_actions=[],
         )
 
-        self.assertEqual(index, 2)
-        self.assertEqual(len(prepared[index:]), 4)
+        self.assertEqual(result, [])
 
     def test_world_locked_joint_handoff_converges_to_absolute_target(self):
         client = _make_client()
@@ -209,35 +206,123 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertIsNone(client._poll_prediction())
         self.assertNotIn(1, client._inference_in_flight)
 
-    def test_gripper_deadband_suppresses_duplicate_rpc_calls(self):
+    def test_gripper_observation_is_scaled_to_model_range(self):
+        client = _make_client()
+        client.GRIPPER_DATA_MAX = 1.55
+        inputs = {
+            "state": {
+                "follow1_pos": np.array([1.0, 4.5], dtype=np.float32),
+                "follow2_pos": np.array([2.0, 2.25], dtype=np.float32),
+                "follow1_gripper": np.array(4.5, dtype=np.float32),
+                "follow2_gripper": np.array(2.25, dtype=np.float32),
+            }
+        }
+
+        client._normalize_gripper_observation(inputs)
+
+        self.assertAlmostEqual(inputs["state"]["follow1_pos"][-1], 1.55)
+        self.assertAlmostEqual(inputs["state"]["follow2_pos"][-1], 0.775)
+        self.assertAlmostEqual(inputs["state"]["follow1_gripper"], 1.55)
+        self.assertAlmostEqual(inputs["state"]["follow2_gripper"], 0.775)
+
+    def test_gripper_release_requires_stable_request_and_dwell(self):
         client = _make_client()
         gripper = _RecordingGripper()
+        client._last_gripper_command["left"] = 0.0
+        client._last_gripper_sent_at["left"] = 1.0
 
-        client._send_gripper_if_needed("left", gripper, 0.0, now=1.0)
-        client._send_gripper_if_needed("left", gripper, 2.0, now=1.1)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.2)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.45)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.65)
-        client._send_gripper_if_needed("left", gripper, 4.0, now=2.7)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=2.1)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=3.2)
 
-        self.assertEqual(gripper.positions, [0.0, 4.5, 4.5])
+        self.assertEqual(gripper.positions, [4.5, 4.5])
 
-    def test_gripper_close_is_immediate(self):
+    def test_gripper_close_waits_for_stable_request_and_low_arm_speed(self):
         client = _make_client()
+        client.control_mode = "end_pose"
         gripper = _RecordingGripper()
+        client._last_gripper_command["right"] = 4.5
+        client._last_gripper_sent_at["right"] = 1.0
+        moving = [0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        previous = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5]
 
-        client._send_gripper_if_needed("right", gripper, 4.0, now=1.0)
-        client._send_gripper_if_needed("right", gripper, 0.5, now=1.01)
+        client._send_gripper_if_needed(
+            "right", gripper, 0.5, now=1.1,
+            arm_action=moving, previous_arm_action=previous,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 0.5, now=1.3,
+            arm_action=moving, previous_arm_action=previous,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 0.5, now=1.4,
+            arm_action=moving, previous_arm_action=moving,
+        )
 
-        self.assertEqual(gripper.positions, [4.5, 0.0])
+        self.assertEqual(gripper.positions, [0.0])
 
     def test_gripper_release_noise_does_not_open_gripper(self):
         client = _make_client()
         gripper = _RecordingGripper()
+        client._last_gripper_command["left"] = 0.0
+        client._last_gripper_sent_at["left"] = 1.0
 
-        client._send_gripper_if_needed("left", gripper, 0.5, now=1.0)
         client._send_gripper_if_needed("left", gripper, 4.0, now=1.05)
         client._send_gripper_if_needed("left", gripper, 2.0, now=1.1)
         client._send_gripper_if_needed("left", gripper, 0.5, now=1.2)
 
+        self.assertEqual(gripper.positions, [])
+
+    def test_gripper_release_requires_travel_after_grasp(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        gripper = _RecordingGripper()
+        client._last_gripper_command["right"] = 0.0
+        client._last_gripper_sent_at["right"] = 0.0
+        client._gripper_closed_pose["right"] = np.zeros(3)
+        at_grasp = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        at_release = [0.06, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        client._send_gripper_if_needed(
+            "right", gripper, 4.0, now=1.0,
+            arm_action=at_grasp, previous_arm_action=at_grasp,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 4.0, now=1.5,
+            arm_action=at_grasp, previous_arm_action=at_grasp,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 4.0, now=1.6,
+            arm_action=at_release, previous_arm_action=at_grasp,
+        )
+        client._send_gripper_if_needed(
+            "right", gripper, 4.0, now=1.7,
+            arm_action=at_release, previous_arm_action=at_release,
+        )
+
+        self.assertEqual(gripper.positions, [4.5])
+
+    def test_gripper_heartbeat_does_not_reset_grasp_pose(self):
+        client = _make_client()
+        client.control_mode = "end_pose"
+        gripper = _RecordingGripper()
+        client._last_gripper_command["right"] = 0.0
+        client._last_gripper_sent_at["right"] = 0.0
+        client._gripper_closed_pose["right"] = np.zeros(3)
+        moved = [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+        client._send_gripper_if_needed(
+            "right",
+            gripper,
+            0.0,
+            now=2.0,
+            arm_action=moved,
+            previous_arm_action=moved,
+        )
+
         self.assertEqual(gripper.positions, [0.0])
+        np.testing.assert_array_equal(
+            client._gripper_closed_pose["right"], np.zeros(3)
+        )

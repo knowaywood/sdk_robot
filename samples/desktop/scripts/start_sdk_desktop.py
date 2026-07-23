@@ -20,8 +20,12 @@ def main(args):
         blend_duration=args.blend_duration,
         world_lock_duration=args.world_lock_duration,
         inference_workers=args.inference_workers,
+        gripper_close_confirm=args.gripper_close_confirm,
         gripper_release_confirm=args.gripper_release_confirm,
         gripper_reopen_dwell=args.gripper_reopen_dwell,
+        gripper_release_travel=args.gripper_release_travel,
+        gripper_transition_linear_speed=args.gripper_transition_linear_speed,
+        gripper_transition_angular_speed=args.gripper_transition_angular_speed,
         max_linear_speed=args.max_linear_speed,
         max_angular_speed=args.max_angular_speed,
     )
@@ -110,17 +114,45 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--gripper-close-confirm",
+        type=float,
+        default=0.15,
+        help="Seconds a close request must remain stable before grasping",
+    )
+
+    parser.add_argument(
         "--gripper-release-confirm",
         type=float,
-        default=0.2,
+        default=0.4,
         help="Seconds an opening command must remain stable before release",
     )
 
     parser.add_argument(
         "--gripper-reopen-dwell",
         type=float,
-        default=0.6,
+        default=1.0,
         help="Minimum seconds before a closed gripper may reopen",
+    )
+
+    parser.add_argument(
+        "--gripper-release-travel",
+        type=float,
+        default=0.05,
+        help="Minimum Cartesian travel after grasp before release is allowed",
+    )
+
+    parser.add_argument(
+        "--gripper-transition-linear-speed",
+        type=float,
+        default=0.08,
+        help="Maximum Cartesian speed for opening or closing the gripper",
+    )
+
+    parser.add_argument(
+        "--gripper-transition-angular-speed",
+        type=float,
+        default=0.6,
+        help="Maximum angular speed for opening or closing the gripper",
     )
 
     parser.add_argument(

@@ -164,12 +164,9 @@ def crossfade_trajectories(
             quat /= max(np.linalg.norm(quat), np.finfo(float).eps)
             action[3:6] = transform.Rotation.from_quat(quat).as_euler("xyz")
 
-        # Closing is safety-critical and takes effect immediately. Opening waits
-        # until the arm handoff completes and is confirmed by the command filter.
-        if new[-1] < old[-1]:
-            action[-1] = new[-1]
-        else:
-            action[-1] = new[-1] if index == overlap - 1 else old[-1]
+        # Keep gripper events synchronized with the arm handoff. The command
+        # filter applies its own stability and low-speed checks afterward.
+        action[-1] = new[-1] if index == overlap - 1 else old[-1]
         blended.append(action.tolist())
 
     blended.extend([list(action) for action in predicted_actions[overlap:]])
