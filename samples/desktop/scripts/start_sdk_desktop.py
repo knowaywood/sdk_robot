@@ -69,8 +69,8 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=100.0,
-        help="Robot command frequency; 100 Hz is recommended, maximum is 200 Hz",
+        default=120.0,
+        help="Robot command frequency; 120 Hz is recommended, maximum is 200 Hz",
     )
 
     parser.add_argument(

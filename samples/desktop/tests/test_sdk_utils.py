@@ -69,6 +69,34 @@ class InterpolateTrajectoryTest(unittest.TestCase):
 
         self.assertLess(np.rad2deg(step_angles.max()), 0.21)
 
+    def test_end_pose_position_has_continuous_velocity_at_keyframe(self):
+        actions = [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+            [1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+        ]
+
+        result = np.asarray(interpolate_trajectory(actions, factor=10))
+        step_before = result[10, 0] - result[9, 0]
+        step_after = result[11, 0] - result[10, 0]
+
+        self.assertLess(abs(step_before - step_after), 0.01)
+        self.assertGreaterEqual(result[:, 0].min(), 0.0)
+        self.assertLessEqual(result[:, 0].max(), 1.2)
+
+    def test_end_pose_rotation_has_continuous_rate_at_keyframe(self):
+        actions = [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.5],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 4.5],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.2, 4.5],
+        ]
+
+        result = np.asarray(interpolate_trajectory(actions, factor=10))
+        rotations = transform.Rotation.from_euler("xyz", result[:, 3:6])
+        step_angles = (rotations[:-1].inv() * rotations[1:]).magnitude()
+
+        self.assertLess(abs(step_angles[9] - step_angles[10]), 0.02)
+
 
 class StitchTrajectoryTest(unittest.TestCase):
     def test_drops_elapsed_actions_and_blends_from_current_command(self):

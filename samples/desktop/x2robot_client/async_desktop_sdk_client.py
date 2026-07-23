@@ -56,7 +56,7 @@ class AsyncDesktopClient(DesktopClient):
     def __init__(
         self,
         *args,
-        control_hz: float = 100.0,
+        control_hz: float = 120.0,
         prefetch_margin: float = 0.2,
         blend_duration: float = 0.15,
         gripper_deadband: float = 0.05,
@@ -384,6 +384,14 @@ class AsyncDesktopClient(DesktopClient):
     def execute_model(self) -> None:
         """Run inference and robot control concurrently using a latest-only buffer."""
         logger.info("Starting asynchronous model execution loop...")
+        logger.info(
+            f"Pipeline config: control_hz={1.0 / self.control_period:.1f}, "
+            f"interpolate_multiplier={self.interpolate_multiplier}, "
+            f"raw_action_interval="
+            f"{self.interpolate_multiplier * self.control_period:.4f}s, "
+            f"prefetch_margin={self.prefetch_margin:.3f}s, "
+            f"blend={self.blend_steps * self.control_period:.3f}s"
+        )
         self._start_inference_worker()
 
         active_actions = deque()

@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 from scipy.spatial import transform
 from x2robot.sensor_msgs import CompressedImage
 
@@ -69,27 +70,33 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
         # Assuming format: [x, y, z, r, p, y, gripper]
         # If dims > 7, we might need to be careful, but assuming 7D for now as per EX001
 
-        # Interpolate non-orientation parts (0,1,2)
-        for i in range(3):
-            interpolated_actions[:, i] = np.interp(
-                target_indices, original_indices, actions_np[:, i]
-            )
+        interpolated_actions[:, :3] = PchipInterpolator(
+            original_indices, actions_np[:, :3], axis=0
+        )(target_indices)
 
         # SLERP for orientation (3,4,5) represented as Euler angles.
         if action_dim >= 6:
             rotations = transform.Rotation.from_euler(
                 "xyz", actions_np[:, 3:6], degrees=False
             )
-            interpolated_actions[:, 3:6] = transform.Slerp(
-                original_indices, rotations
-            )(target_indices).as_euler("xyz", degrees=False)
+            if num_actions >= 3:
+                interpolated_rotations = transform.RotationSpline(
+                    original_indices, rotations
+                )(target_indices)
+            else:
+                interpolated_rotations = transform.Slerp(
+                    original_indices, rotations
+                )(target_indices)
+            interpolated_actions[:, 3:6] = interpolated_rotations.as_euler(
+                "xyz", degrees=False
+            )
 
     else:
-        # The last dimension is the gripper; only interpolate arm joints here.
-        for i in range(action_dim - 1):
-            interpolated_actions[:, i] = np.interp(
-                target_indices, original_indices, actions_np[:, i]
-            )
+        # PCHIP keeps joint velocity continuous without overshooting keyframes.
+        if action_dim > 1:
+            interpolated_actions[:, :-1] = PchipInterpolator(
+                original_indices, actions_np[:, :-1], axis=0
+            )(target_indices)
 
     has_gripper = action_dim > 6 if mode == "end_pose" else action_dim > 0
     if has_gripper:
