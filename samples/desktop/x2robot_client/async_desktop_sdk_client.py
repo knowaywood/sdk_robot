@@ -58,17 +58,23 @@ class AsyncDesktopClient(DesktopClient):
     def __init__(
         self,
         *args,
-        control_hz: float = 110.0,
-        prefetch_margin: float = 0.1,
+        control_hz: float = 120.0,
+        prefetch_margin: float = 0.05,
         blend_duration: float = 0.3,
-        gripper_deadband: float = 0.05,
+        gripper_deadband: float = 0.1,
+        gripper_release_confirm: float = 0.12,
         inference_workers: int = 1,
-        motion_scale: float = 1.2,
+        motion_scale: float = 1.0,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
             raise ValueError("control_hz must be in the range (0, 200]")
-        if prefetch_margin < 0 or blend_duration < 0 or gripper_deadband < 0:
+        if (
+            prefetch_margin < 0
+            or blend_duration < 0
+            or gripper_deadband < 0
+            or gripper_release_confirm < 0
+        ):
             raise ValueError("pipeline timing and deadband values must be non-negative")
         if inference_workers < 1 or inference_workers > 4:
             raise ValueError("inference_workers must be in the range [1, 4]")
@@ -79,6 +85,7 @@ class AsyncDesktopClient(DesktopClient):
         self.prefetch_margin = prefetch_margin
         self.blend_steps = int(round(blend_duration / self.control_period))
         self.gripper_deadband = gripper_deadband
+        self.gripper_release_confirm = gripper_release_confirm
         self.inference_workers = inference_workers
         self.motion_scale = motion_scale
 
@@ -94,6 +101,7 @@ class AsyncDesktopClient(DesktopClient):
         self._last_applied_request_id = 0
         self._last_gripper_command = {"left": None, "right": None}
         self._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
+        self._gripper_release_candidate = {"left": None, "right": None}
 
         super().__init__(*args, **kwargs)
 
@@ -563,6 +571,16 @@ class AsyncDesktopClient(DesktopClient):
 
     def _send_gripper_if_needed(self, side: str, gripper, position: float, now: float):
         previous = self._last_gripper_command[side]
+        if previous is not None and position > previous + self.gripper_deadband:
+            candidate = self._gripper_release_candidate[side]
+            if candidate is None or abs(position - candidate[0]) >= self.gripper_deadband:
+                self._gripper_release_candidate[side] = (position, now)
+                return
+            if now - candidate[1] < self.gripper_release_confirm:
+                return
+        else:
+            self._gripper_release_candidate[side] = None
+
         heartbeat_due = (
             now - self._last_gripper_sent_at[side] >= self.GRIPPER_HEARTBEAT_SECONDS
         )
@@ -572,8 +590,14 @@ class AsyncDesktopClient(DesktopClient):
             or heartbeat_due
         ):
             gripper.set_position(GripperPosition(position=position))
+            if previous is None or abs(position - previous) >= self.gripper_deadband:
+                previous_text = "initial" if previous is None else f"{previous:.2f}"
+                logger.info(
+                    f"Gripper {side}: {previous_text} -> {position:.2f} physical"
+                )
             self._last_gripper_command[side] = position
             self._last_gripper_sent_at[side] = now
+            self._gripper_release_candidate[side] = None
 
     def _gripper_to_physical_range(self, value: float) -> float:
         scaled = value / self._model_gripper_max() * self.GRIPPER_PHYSICAL_MAX
@@ -652,7 +676,8 @@ class AsyncDesktopClient(DesktopClient):
             f"prefetch_margin={self.prefetch_margin:.3f}s, "
             f"blend={self.blend_steps * self.control_period:.3f}s, "
             f"inference_workers={worker_count}, "
-            f"motion_scale={self.motion_scale:.2f}"
+            f"motion_scale={self.motion_scale:.2f}, "
+            f"gripper_release_confirm={self.gripper_release_confirm:.2f}s"
         )
 
         active_actions = deque()

@@ -38,9 +38,11 @@ def _make_client():
     client._discard_before_request_id = 0
     client._last_applied_request_id = 0
     client.gripper_deadband = 0.05
+    client.gripper_release_confirm = 0.12
     client.GRIPPER_DATA_MAX = 4.5
     client._last_gripper_command = {"left": None, "right": None}
     client._last_gripper_sent_at = {"left": 0.0, "right": 0.0}
+    client._gripper_release_candidate = {"left": None, "right": None}
     return client
 
 
@@ -212,6 +214,26 @@ class AsyncPipelineTest(unittest.TestCase):
         client._send_gripper_if_needed("left", gripper, 2.0, now=1.0)
         client._send_gripper_if_needed("left", gripper, 2.02, now=1.1)
         client._send_gripper_if_needed("left", gripper, 2.2, now=1.2)
-        client._send_gripper_if_needed("left", gripper, 2.2, now=2.3)
+        client._send_gripper_if_needed("left", gripper, 2.2, now=1.35)
+        client._send_gripper_if_needed("left", gripper, 2.2, now=2.4)
 
         self.assertEqual(gripper.positions, [2.0, 2.2, 2.2])
+
+    def test_gripper_close_is_immediate(self):
+        client = _make_client()
+        gripper = _RecordingGripper()
+
+        client._send_gripper_if_needed("right", gripper, 4.0, now=1.0)
+        client._send_gripper_if_needed("right", gripper, 1.0, now=1.01)
+
+        self.assertEqual(gripper.positions, [4.0, 1.0])
+
+    def test_gripper_release_noise_does_not_open_gripper(self):
+        client = _make_client()
+        gripper = _RecordingGripper()
+
+        client._send_gripper_if_needed("left", gripper, 1.0, now=1.0)
+        client._send_gripper_if_needed("left", gripper, 4.0, now=1.05)
+        client._send_gripper_if_needed("left", gripper, 1.0, now=1.1)
+
+        self.assertEqual(gripper.positions, [1.0])

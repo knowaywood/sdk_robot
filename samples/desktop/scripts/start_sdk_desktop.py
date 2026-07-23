@@ -20,6 +20,7 @@ def main(args):
         blend_duration=args.blend_duration,
         inference_workers=args.inference_workers,
         motion_scale=args.motion_scale,
+        gripper_release_confirm=args.gripper_release_confirm,
     )
 
     try:
@@ -71,14 +72,14 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=110.0,
-        help="Robot command frequency; 110 Hz is recommended, maximum is 200 Hz",
+        default=120.0,
+        help="Robot command frequency; 120 Hz is recommended, maximum is 200 Hz",
     )
 
     parser.add_argument(
         "--prefetch-margin",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Extra action-buffer time kept beyond measured inference latency",
     )
 
@@ -101,8 +102,15 @@ def parse_args():
     parser.add_argument(
         "--motion-scale",
         type=float,
-        default=1.2,
+        default=1.0,
         help="Scale arm trajectory increments without shortening the action buffer",
+    )
+
+    parser.add_argument(
+        "--gripper-release-confirm",
+        type=float,
+        default=0.12,
+        help="Seconds an opening command must remain stable before release",
     )
 
     parser.add_argument(

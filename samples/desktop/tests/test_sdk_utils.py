@@ -135,7 +135,7 @@ class StitchTrajectoryTest(unittest.TestCase):
 
 
 class CrossfadeTrajectoriesTest(unittest.TestCase):
-    def test_uses_minimum_jerk_weights_and_preserves_gripper_event(self):
+    def test_uses_minimum_jerk_weights_and_prioritizes_gripper_close(self):
         existing = [[0.0, 4.5], [1.0, 4.5], [2.0, 4.5], [3.0, 4.5]]
         predicted = [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [6.0, 0.0]]
 
@@ -146,7 +146,17 @@ class CrossfadeTrajectoriesTest(unittest.TestCase):
         np.testing.assert_allclose(
             result[:, 0], [0.0, 1.5, 3.79296875, 6.0]
         )
-        np.testing.assert_allclose(result[:, -1], [4.5, 4.5, 4.5, 0.0])
+        np.testing.assert_allclose(result[:, -1], [0.0, 0.0, 0.0, 0.0])
+
+    def test_delays_gripper_open_until_arm_handoff_finishes(self):
+        existing = [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]
+        predicted = [[0.0, 4.5], [2.0, 4.5], [4.0, 4.5], [6.0, 4.5]]
+
+        result = np.asarray(
+            crossfade_trajectories(existing, predicted, 4, mode="joints")
+        )
+
+        np.testing.assert_allclose(result[:, -1], [0.0, 0.0, 0.0, 4.5])
 
 
 if __name__ == "__main__":

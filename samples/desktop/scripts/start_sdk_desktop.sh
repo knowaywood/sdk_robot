@@ -12,7 +12,7 @@ INSTRUCTION=${3:-"Pick up the green cup and place it on the tray."}
 CONTROL_MODE=${4:-"end_pose"}
 INTERPOLATE_MULTIPLIER=${5:-10}
 ROBOT_SDK_URL=${6:-"192.168.10.1:50051"}
-MOTION_SCALE=${7:-1.2}
+MOTION_SCALE=${7:-1.0}
 
 echo "Starting Desktop Client..."
 echo "Model: $MODEL_ADDRESS:$MODEL_PORT"
