@@ -79,8 +79,8 @@ def parse_args():
     parser.add_argument(
         "--control-hz",
         type=float,
-        default=110.0,
-        help="Robot command frequency; 110 Hz is recommended, maximum is 200 Hz",
+        default=140.0,
+        help="Robot command frequency; 140 Hz is recommended, maximum is 200 Hz",
     )
 
     parser.add_argument(
@@ -93,14 +93,14 @@ def parse_args():
     parser.add_argument(
         "--blend-duration",
         type=float,
-        default=0.3,
+        default=0.2,
         help="Arm trajectory blend duration when replacing an action chunk",
     )
 
     parser.add_argument(
         "--world-lock-duration",
         type=float,
-        default=0.5,
+        default=0.25,
         help="Seconds to converge from the handoff state to absolute model targets",
     )
 

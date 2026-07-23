@@ -67,7 +67,7 @@ class AsyncPipelineTest(unittest.TestCase):
         self.assertFalse(missed)
         self.assertAlmostEqual(next_tick, 2.01)
 
-    def test_prediction_skips_actions_executed_during_inference(self):
+    def test_prediction_preserves_full_semantic_horizon_after_inference(self):
         client = _make_client()
         request = _InferenceRequest(request_id=1, control_step=10)
         prediction = _PredictionChunk(
@@ -89,12 +89,15 @@ class AsyncPipelineTest(unittest.TestCase):
             active_actions=[],
         )
 
-        self.assertEqual([pair[0][0] for pair in result], [-1.0, 0.5, 2.0])
         self.assertEqual(
-            [pair[0][-1] for pair in result], [4.5, 4.5, 0.0]
+            [pair[0][0] for pair in result], [-1.0, 0.0, 1.0, 1.5, 2.0]
+        )
+        self.assertEqual(
+            [pair[0][-1] for pair in result],
+            [4.5, 4.5, 4.5, 4.5, 0.0],
         )
 
-    def test_prediction_is_discarded_when_latency_exceeds_action_horizon(self):
+    def test_long_inference_does_not_drop_semantic_action_stages(self):
         client = _make_client()
         prediction = _PredictionChunk(
             request=_InferenceRequest(request_id=1, control_step=10),
@@ -115,7 +118,8 @@ class AsyncPipelineTest(unittest.TestCase):
             active_actions=[],
         )
 
-        self.assertEqual(result, [])
+        self.assertEqual(len(result), 5)
+        self.assertEqual([pair[0][-1] for pair in result][-1], 0.0)
 
     def test_world_locked_joint_handoff_converges_to_absolute_target(self):
         client = _make_client()

@@ -61,10 +61,10 @@ class AsyncDesktopClient(DesktopClient):
     def __init__(
         self,
         *args,
-        control_hz: float = 110.0,
+        control_hz: float = 140.0,
         prefetch_margin: float = 0.1,
-        blend_duration: float = 0.3,
-        world_lock_duration: float = 0.5,
+        blend_duration: float = 0.2,
+        world_lock_duration: float = 0.25,
         gripper_deadband: float = 0.1,
         gripper_close_confirm: float = 0.15,
         gripper_release_confirm: float = 0.4,
@@ -389,22 +389,15 @@ class AsyncDesktopClient(DesktopClient):
         if not prepared:
             return []
 
-        elapsed_steps = 0
+        inference_steps = 0
         if prediction.request.control_step is not None:
-            elapsed_steps = max(
+            inference_steps = max(
                 0, control_step - prediction.request.control_step
             )
-        if elapsed_steps >= len(prepared):
-            logger.warning(
-                f"Discarding stale prediction #{prediction.request.request_id}: "
-                f"elapsed={elapsed_steps}, chunk={len(prepared)}"
-            )
-            return []
 
         reference = last_command or (active_actions[0] if active_actions else None)
-        alignment_index = elapsed_steps
-        remaining = prepared[alignment_index:]
-        rebased = reference is not None and elapsed_steps > 0
+        remaining = prepared
+        rebased = reference is not None
         handoff_error = self._format_handoff_error(remaining[0], reference)
         if rebased:
             left_remaining = self._align_actions_to_world_reference(
@@ -469,8 +462,8 @@ class AsyncDesktopClient(DesktopClient):
         logger.info(
             f"Prediction #{prediction.request.request_id}: "
             f"latency={prediction.latency:.3f}s, "
-            f"elapsed={elapsed_steps}"
-            f"({elapsed_steps * self.control_period:.3f}s), "
+            f"inference_steps={inference_steps}"
+            f"({inference_steps * self.control_period:.3f}s), "
             f"crossfade={overlap_steps}, "
             f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
