@@ -19,6 +19,7 @@ def main(args):
         prefetch_margin=args.prefetch_margin,
         blend_duration=args.blend_duration,
         inference_workers=args.inference_workers,
+        motion_scale=args.motion_scale,
     )
 
     try:
@@ -95,6 +96,13 @@ def parse_args():
         choices=range(1, 5),
         metavar="{1,2,3,4}",
         help="Number of model connections; 1 avoids server-side contention",
+    )
+
+    parser.add_argument(
+        "--motion-scale",
+        type=float,
+        default=1.2,
+        help="Scale arm trajectory increments without shortening the action buffer",
     )
 
     parser.add_argument(

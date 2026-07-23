@@ -29,6 +29,7 @@ def _make_client():
     client.control_mode = "joints"
     client.interpolate_multiplier = 2
     client.blend_steps = 2
+    client.motion_scale = 1.0
     client._inference_clients = [object(), object()]
     client._inference_in_flight = set()
     client._request_queue = Queue(maxsize=2)
@@ -122,6 +123,32 @@ class AsyncPipelineTest(unittest.TestCase):
 
         self.assertEqual([action[0] for action in result], [0.0, 2.0, 4.0])
         self.assertEqual([action[-1] for action in result], [4.5, 4.5, 0.0])
+
+    def test_motion_scale_increases_joint_trajectory_increments(self):
+        client = _make_client()
+        client.motion_scale = 1.5
+
+        result = client._shift_actions_to_reference(
+            [[2.0, 4.5], [4.0, 4.5], [6.0, 0.0]],
+            reference=[0.0, 4.5],
+        )
+
+        self.assertEqual([action[0] for action in result], [0.0, 3.0, 6.0])
+        self.assertEqual([action[-1] for action in result], [4.5, 4.5, 0.0])
+
+    def test_short_blend_source_is_extended_with_decaying_velocity(self):
+        client = _make_client()
+
+        result = client._extend_blend_trajectory(
+            [[0.0, 4.5], [1.0, 4.5]],
+            previous_action=[-1.0, 4.5],
+            target_steps=5,
+        )
+
+        np.testing.assert_allclose(
+            [action[0] for action in result], [0.0, 1.0, 1.75, 2.25, 2.5]
+        )
+        self.assertEqual([action[-1] for action in result], [4.5] * 5)
 
     def test_relative_end_pose_handoff_preserves_motion(self):
         client = _make_client()

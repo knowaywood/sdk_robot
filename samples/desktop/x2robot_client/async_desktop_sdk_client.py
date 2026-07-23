@@ -63,6 +63,7 @@ class AsyncDesktopClient(DesktopClient):
         blend_duration: float = 0.3,
         gripper_deadband: float = 0.05,
         inference_workers: int = 1,
+        motion_scale: float = 1.2,
         **kwargs,
     ):
         if control_hz <= 0 or control_hz > 200:
@@ -71,12 +72,15 @@ class AsyncDesktopClient(DesktopClient):
             raise ValueError("pipeline timing and deadband values must be non-negative")
         if inference_workers < 1 or inference_workers > 4:
             raise ValueError("inference_workers must be in the range [1, 4]")
+        if motion_scale <= 0 or motion_scale > 2:
+            raise ValueError("motion_scale must be in the range (0, 2]")
 
         self.control_period = 1.0 / control_hz
         self.prefetch_margin = prefetch_margin
         self.blend_steps = int(round(blend_duration / self.control_period))
         self.gripper_deadband = gripper_deadband
         self.inference_workers = inference_workers
+        self.motion_scale = motion_scale
 
         self._request_queue = queue.Queue(maxsize=inference_workers)
         self._prediction_queue = queue.Queue(maxsize=2 * inference_workers)
@@ -312,25 +316,42 @@ class AsyncDesktopClient(DesktopClient):
         remaining = prepared[alignment_index:]
         rebased = reference is not None and minimum_buffer_steps > 0
         handoff_error = self._format_handoff_error(remaining[0], reference)
-        if rebased:
+        if rebased or self.motion_scale != 1.0:
+            left_reference = reference[0] if reference is not None else remaining[0][0]
+            right_reference = (
+                reference[1] if reference is not None else remaining[0][1]
+            )
             left_remaining = self._shift_actions_to_reference(
                 [pair[0] for pair in remaining],
-                reference[0],
+                left_reference,
             )
             right_remaining = self._shift_actions_to_reference(
                 [pair[1] for pair in remaining],
-                reference[1],
+                right_reference,
             )
             remaining = list(zip(left_remaining, right_remaining))
-        if active_actions:
-            left_actions = crossfade_trajectories(
+        use_velocity_blend = bool(active_actions) or (
+            last_command is not None and rebased
+        )
+        if use_velocity_blend:
+            left_blend_source = self._extend_blend_trajectory(
                 [pair[0] for pair in active_actions],
+                last_command[0] if last_command is not None else None,
+                self.blend_steps,
+            )
+            right_blend_source = self._extend_blend_trajectory(
+                [pair[1] for pair in active_actions],
+                last_command[1] if last_command is not None else None,
+                self.blend_steps,
+            )
+            left_actions = crossfade_trajectories(
+                left_blend_source,
                 [pair[0] for pair in remaining],
                 self.blend_steps,
                 self.control_mode,
             )
             right_actions = crossfade_trajectories(
-                [pair[1] for pair in active_actions],
+                right_blend_source,
                 [pair[1] for pair in remaining],
                 self.blend_steps,
                 self.control_mode,
@@ -353,18 +374,74 @@ class AsyncDesktopClient(DesktopClient):
                 self.control_mode,
             )
 
+        available_overlap = min(self.blend_steps, len(active_actions))
         overlap_steps = min(
-            self.blend_steps, len(active_actions), len(remaining)
+            self.blend_steps,
+            len(remaining),
+            len(left_blend_source) if use_velocity_blend else 0,
         )
         logger.info(
             f"Prediction #{prediction.request.request_id}: "
             f"latency={prediction.latency:.3f}s, aligned={alignment_index}, "
             f"crossfade={overlap_steps}, "
+            f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
             f"handoff_error={handoff_error}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
         )
         return list(zip(left_actions, right_actions))
+
+    def _extend_blend_trajectory(
+        self,
+        actions: List[list],
+        previous_action: Optional[list],
+        target_steps: int,
+    ) -> List[list]:
+        """Extend a short old trajectory with a smoothly decaying velocity."""
+        extended = [list(action) for action in actions[:target_steps]]
+        if not extended:
+            if previous_action is None:
+                return []
+            extended = [list(previous_action)]
+        if len(extended) >= target_steps:
+            return extended
+
+        if len(extended) >= 2:
+            velocity_start = np.asarray(extended[-2], dtype=float)
+        elif previous_action is not None:
+            velocity_start = np.asarray(previous_action, dtype=float)
+        else:
+            velocity_start = np.asarray(extended[-1], dtype=float)
+        velocity_end = np.asarray(extended[-1], dtype=float)
+        missing = target_steps - len(extended)
+
+        if self.control_mode == "end_pose":
+            linear_velocity = velocity_end[:3] - velocity_start[:3]
+            start_rotation = transform.Rotation.from_euler(
+                "xyz", velocity_start[3:6]
+            )
+            end_rotation = transform.Rotation.from_euler("xyz", velocity_end[3:6])
+            angular_velocity = (start_rotation.inv() * end_rotation).as_rotvec()
+        else:
+            joint_velocity = velocity_end[:-1] - velocity_start[:-1]
+
+        for offset in range(1, missing + 1):
+            velocity_weight = 1.0 - offset / (missing + 1)
+            next_action = np.asarray(extended[-1], dtype=float).copy()
+            if self.control_mode == "end_pose":
+                next_action[:3] += velocity_weight * linear_velocity
+                next_rotation = transform.Rotation.from_euler(
+                    "xyz", next_action[3:6]
+                ) * transform.Rotation.from_rotvec(
+                    velocity_weight * angular_velocity
+                )
+                next_action[3:6] = next_rotation.as_euler("xyz")
+            else:
+                next_action[:-1] += velocity_weight * joint_velocity
+            next_action[-1] = extended[-1][-1]
+            extended.append(next_action.tolist())
+
+        return extended
 
     def _format_handoff_error(
         self,
@@ -414,24 +491,31 @@ class AsyncDesktopClient(DesktopClient):
         reference_array = np.asarray(reference, dtype=float)
 
         if self.control_mode == "end_pose":
-            position_offset = reference_array[:3] - corrected[0, :3]
-            corrected[:, :3] += position_offset
+            initial_position = corrected[0, :3].copy()
+            corrected[:, :3] = reference_array[:3] + self.motion_scale * (
+                corrected[:, :3] - initial_position
+            )
             reference_rotation = transform.Rotation.from_euler(
                 "xyz", reference_array[3:6]
             )
             initial_rotation = transform.Rotation.from_euler(
                 "xyz", corrected[0, 3:6]
             )
-            rotation_offset = reference_rotation * initial_rotation.inv()
             target_rotations = transform.Rotation.from_euler(
                 "xyz", corrected[:, 3:6]
             )
+            relative_rotations = initial_rotation.inv() * target_rotations
+            scaled_rotations = transform.Rotation.from_rotvec(
+                self.motion_scale * relative_rotations.as_rotvec()
+            )
             corrected[:, 3:6] = (
-                rotation_offset * target_rotations
+                reference_rotation * scaled_rotations
             ).as_euler("xyz")
         else:
-            joint_offset = reference_array[:-1] - corrected[0, :-1]
-            corrected[:, :-1] += joint_offset
+            initial_joints = corrected[0, :-1].copy()
+            corrected[:, :-1] = reference_array[:-1] + self.motion_scale * (
+                corrected[:, :-1] - initial_joints
+            )
 
         return corrected.tolist()
 
@@ -567,7 +651,8 @@ class AsyncDesktopClient(DesktopClient):
             f"{self.interpolate_multiplier * self.control_period:.4f}s, "
             f"prefetch_margin={self.prefetch_margin:.3f}s, "
             f"blend={self.blend_steps * self.control_period:.3f}s, "
-            f"inference_workers={worker_count}"
+            f"inference_workers={worker_count}, "
+            f"motion_scale={self.motion_scale:.2f}"
         )
 
         active_actions = deque()
