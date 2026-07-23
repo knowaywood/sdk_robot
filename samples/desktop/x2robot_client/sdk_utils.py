@@ -115,6 +115,31 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
     return interpolated_actions.tolist()
 
 
+def stitch_trajectory(
+    current_action: list,
+    predicted_actions: list,
+    elapsed_steps: int,
+    blend_steps: int,
+    mode: str = "end_pose",
+) -> list:
+    """Drop stale predictions and blend the arm into the remaining trajectory."""
+    if not predicted_actions:
+        return []
+
+    skip = max(0, int(elapsed_steps))
+    if skip >= len(predicted_actions):
+        return []
+
+    remaining = [list(action) for action in predicted_actions[skip:]]
+    if current_action is None or blend_steps <= 0:
+        return remaining
+
+    transition = interpolate_trajectory(
+        [list(current_action), remaining[0]], max(1, int(blend_steps)), mode
+    )
+    return transition[1:] + remaining[1:]
+
+
 def smoothen(
     arr: np.ndarray, window: int = None, poly: int = 2, ema_alpha: float = 0.25
 ) -> np.ndarray:

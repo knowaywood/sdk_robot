@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 
-from x2robot_client.desktop_sdk_client import DesktopClient
+from x2robot_client.async_desktop_sdk_client import AsyncDesktopClient
 
 
 def main(args):
-    client = DesktopClient(
+    client = AsyncDesktopClient(
         model_address=args.model_address,
         model_port=args.port,
         instruction=args.instruction,
@@ -15,6 +15,9 @@ def main(args):
         interpolate_multiplier=args.interpolate_multiplier,
         debug_step=args.debug_step,
         robot_sdk_url=args.robot_sdk_url,
+        control_hz=args.control_hz,
+        prefetch_margin=args.prefetch_margin,
+        blend_duration=args.blend_duration,
     )
 
     try:
@@ -61,6 +64,27 @@ def parse_args():
         type=int,
         default=20,
         help="Interpolate multiplier for action execution",
+    )
+
+    parser.add_argument(
+        "--control-hz",
+        type=float,
+        default=200.0,
+        help="Robot command frequency, up to 200 Hz",
+    )
+
+    parser.add_argument(
+        "--prefetch-margin",
+        type=float,
+        default=0.1,
+        help="Extra action-buffer time kept beyond measured inference latency",
+    )
+
+    parser.add_argument(
+        "--blend-duration",
+        type=float,
+        default=0.075,
+        help="Arm trajectory blend duration when replacing an action chunk",
     )
 
     parser.add_argument(
