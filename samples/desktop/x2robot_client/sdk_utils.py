@@ -48,7 +48,7 @@ def interpolate_trajectory(actions: list, factor: int, mode: str = "end_pose") -
     Returns:
         Interpolated list of actions
     """
-    if not actions or len(actions) < 2 or factor <= 1:
+    if actions is None or len(actions) < 2 or factor <= 1:
         return actions
 
     actions_np = np.array(actions)
@@ -116,7 +116,7 @@ def restore_gripper_from_raw(
     """Override the last dim (gripper) of interpolated arm actions with
     nearest-neighbour values from the raw (pre-interpolation) actions,
     preventing linear interpolation artifacts on the binary gripper."""
-    if not interpolated or not raw or factor <= 1:
+    if interpolated is None or raw is None or factor <= 1:
         return interpolated
     raw_arr = np.asarray(raw, dtype=np.float64)
     out = np.asarray(interpolated, dtype=np.float64)

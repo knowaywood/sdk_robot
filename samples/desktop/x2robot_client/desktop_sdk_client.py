@@ -333,9 +333,11 @@ class DesktopClient(RobotClientBase):
 
         if self.interpolate_multiplier > 1:
             if self.last_arm_l_pos is not None:
-                arm1_actions = [self.last_arm_l_pos] + arm1_actions
+                base = arm1_actions.tolist() if isinstance(arm1_actions, np.ndarray) else arm1_actions
+                arm1_actions = [self.last_arm_l_pos] + base
             if self.last_arm_r_pos is not None:
-                arm2_actions = [self.last_arm_r_pos] + arm2_actions
+                base = arm2_actions.tolist() if isinstance(arm2_actions, np.ndarray) else arm2_actions
+                arm2_actions = [self.last_arm_r_pos] + base
 
         raw_arm1 = arm1_actions
         raw_arm2 = arm2_actions
