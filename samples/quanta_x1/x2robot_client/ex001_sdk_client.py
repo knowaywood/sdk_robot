@@ -109,6 +109,8 @@ class EX001SDKClient(RobotClientBase):
         use_car_pose_odom: bool = False,
         robot_sdk_url: str = "",
         save_debug_plot: bool = False,
+        smooth_chunks: bool = False,
+        blend_steps: int = 3,
     ):
         self.control_mode = control_mode
         self.camera_history_k = camera_history_k
@@ -133,7 +135,7 @@ class EX001SDKClient(RobotClientBase):
             logger.info(
                 f"[DEBUG PLOT] Saving action_chunk plots to: {self.plot_dir} (cwd when started: {cwd})"
             )
-        super().__init__(model_address, model_port, instruction, max_retries)
+        super().__init__(model_address, model_port, instruction, max_retries, smooth_chunks, blend_steps)
 
     def _init_robot_controller(self):
         """Initialize robot controller using robocontrol."""

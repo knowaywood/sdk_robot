@@ -16,6 +16,8 @@ def main(args):
         use_car_pose_odom=args.use_car_pose_odom,
         debug_step=args.debug_step,
         robot_sdk_url=args.robot_sdk_url,
+        smooth_chunks=args.smooth_chunks,
+        blend_steps=args.blend_steps,
     )
 
     try:
@@ -81,6 +83,19 @@ def parse_args():
         "--use-car-pose-odom",
         action="store_true",
         help="Use car pose odom for chassis control",
+    )
+
+    parser.add_argument(
+        "--smooth-chunks",
+        action="store_true",
+        help="Enable smooth chunk boundary blending",
+    )
+
+    parser.add_argument(
+        "--blend-steps",
+        type=int,
+        default=3,
+        help="Number of initial steps to blend when smooth-chunks is enabled",
     )
 
     return parser.parse_args()

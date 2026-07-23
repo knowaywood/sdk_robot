@@ -15,6 +15,8 @@ def main(args):
         interpolate_multiplier=args.interpolate_multiplier,
         debug_step=args.debug_step,
         robot_sdk_url=args.robot_sdk_url,
+        smooth_chunks=args.smooth_chunks,
+        blend_steps=args.blend_steps,
     )
 
     try:
@@ -74,6 +76,19 @@ def parse_args():
         default="localhost:50015",
         type=str,
         help="Robot SDK service address (host:port), e.g. localhost:50015",
+    )
+
+    parser.add_argument(
+        "--smooth-chunks",
+        action="store_true",
+        help="Enable smooth chunk boundary blending",
+    )
+
+    parser.add_argument(
+        "--blend-steps",
+        type=int,
+        default=3,
+        help="Number of initial steps to blend when smooth-chunks is enabled",
     )
 
     return parser.parse_args()

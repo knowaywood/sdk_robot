@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import dns.resolver
 from x2robot_client.inference_client import RobotClient
+from x2robot_client.rtc_inference import smooth_chunk_boundary
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,15 @@ class RobotClientBase(ABC):
         model_port: int,
         instruction: str = "",
         max_retries: int = 3,
+        smooth_chunks: bool = False,
+        blend_steps: int = 3,
     ):
         self.model_address = model_address
         self.model_port = model_port
         self.instruction = instruction
         self.max_retries = max_retries
+        self.smooth_chunks = smooth_chunks
+        self.blend_steps = blend_steps
 
         if not self.ip_address(model_address):
             try:
@@ -36,6 +41,7 @@ class RobotClientBase(ABC):
         self.action_terminator = True
         self.remote_control = False
         self.client: Optional[RobotClient] = None
+        self.prev_outputs: Optional[Dict[str, Any]] = None
 
         # Initialize components
         self._init_inference_client()
@@ -115,7 +121,14 @@ class RobotClientBase(ABC):
                     outputs = self._inference_with_retry(sensor_data)
                     ed_time_2 = time.time()
 
-                    # 3. Execute actions
+                    # 3. Smooth chunk boundary (if enabled)
+                    if self.smooth_chunks:
+                        outputs = smooth_chunk_boundary(
+                            self.prev_outputs, outputs, self.blend_steps
+                        )
+                    self.prev_outputs = outputs
+
+                    # 4. Execute actions
                     st_time_3 = time.time()
                     self._execute_actions(outputs)
                     ed_time_3 = time.time()

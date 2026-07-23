@@ -12,11 +12,17 @@ INSTRUCTION=${3:-""}
 CONTROL_MODE=${4:-"end_pose"}
 INTERPOLATE_MULTIPLIER=${5:-20}
 ROBOT_SDK_URL=${6:-"192.168.10.1:50051"}
+SMOOTH_CHUNKS=${7:-""}
+BLEND_STEPS=${8:-3}
 
 echo "Starting EX001 Robot Client..."
 echo "Model: $MODEL_ADDRESS:$MODEL_PORT"
 echo "Instruction: $INSTRUCTION"
 echo "Control Mode: $CONTROL_MODE"
+echo "Smooth Chunks: $SMOOTH_CHUNKS"
+echo "Blend Steps: $BLEND_STEPS"
+
+[ -n "$SMOOTH_CHUNKS" ] && SMOOTH_CHUNKS_FLAG="--smooth-chunks" || SMOOTH_CHUNKS_FLAG=""
 
 python3 "$SCRIPT_DIR/start_sdk_ex001.py" \
     --model-address "$MODEL_ADDRESS" \
@@ -26,4 +32,5 @@ python3 "$SCRIPT_DIR/start_sdk_ex001.py" \
     --interpolate-multiplier "$INTERPOLATE_MULTIPLIER" \
     --robot_sdk_url "$ROBOT_SDK_URL" \
     --debug-step \
-    # --use-car-pose-odom
+    $SMOOTH_CHUNKS_FLAG \
+    --blend-steps "$BLEND_STEPS"
