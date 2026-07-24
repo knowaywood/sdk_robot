@@ -135,6 +135,10 @@ class AsyncDesktopClient(DesktopClient):
         self._gripper_transition_candidate = {"left": None, "right": None}
         self._gripper_closed_pose = {"left": None, "right": None}
         self._gripper_open_pose = {"left": None, "right": None}
+        self._gripper_synthetic_preopen = {
+            "left": False,
+            "right": False,
+        }
         self._gripper_block_counts = {
             "motion": 0,
             "approach": 0,
@@ -201,48 +205,79 @@ class AsyncDesktopClient(DesktopClient):
 
     def _initialize_gripper_states(self):
         now = time.monotonic()
+
         for side in ("left", "right"):
-            gripper = getattr(self.robot_controller, f"{side}_gripper")
+            gripper = getattr(
+                self.robot_controller,
+                f"{side}_gripper",
+            )
             measured = gripper.get_position()
-            physical = (
+
+            feedback = (
                 float(measured.position)
                 if hasattr(measured, "position")
                 else float(measured)
             )
+
+            # get_position() returns the model/data feedback range
+            # (approximately 0..1.55), not the 0..4.5 command range.
+            model_max = self._model_gripper_max()
+            feedback = float(
+                np.clip(feedback, 0.0, model_max)
+            )
+
             logical = (
                 self.GRIPPER_PHYSICAL_MAX
-                if physical >= self.GRIPPER_PHYSICAL_MAX / 2.0
+                if feedback >= model_max / 2.0
                 else 0.0
             )
+
             self._last_gripper_command[side] = logical
             self._last_gripper_sent_at[side] = now
             self._gripper_transition_candidate[side] = None
             self._gripper_closed_pose[side] = None
             self._gripper_open_pose[side] = None
+
             logger.info(
                 f"Gripper {side}: initialized as "
                 f"{'open' if logical > 0 else 'closed'} "
-                f"(measured={physical:.2f})"
+                f"(feedback={feedback:.3f}/{model_max:.3f})"
             )
 
     def _normalize_gripper_observation(self, inputs: Dict):
         state = inputs.get("state", {})
         model_max = self._model_gripper_max()
+
         for pose_key, gripper_key in (
             ("follow1_pos", "follow1_gripper"),
             ("follow2_pos", "follow2_gripper"),
         ):
+            if pose_key not in state:
+                continue
+
             pose = np.asarray(state[pose_key]).copy()
-            physical = float(pose[-1])
-            model_value = (
-                physical / self.GRIPPER_PHYSICAL_MAX * model_max
+
+            # Sensor feedback collected by DesktopClient is already in
+            # the model/data range. Only clamp it; do not divide by 4.5.
+            model_value = float(
+                np.clip(
+                    float(pose[-1]),
+                    0.0,
+                    model_max,
+                )
             )
+
             pose[-1] = model_value
             state[pose_key] = pose
-            gripper_value = np.asarray(state[gripper_key])
-            state[gripper_key] = np.asarray(
-                model_value, dtype=gripper_value.dtype
-            )
+
+            if gripper_key in state:
+                gripper_value = np.asarray(
+                    state[gripper_key]
+                )
+                state[gripper_key] = np.asarray(
+                    model_value,
+                    dtype=gripper_value.dtype,
+                )
 
     def _put_latest_prediction(self, prediction: _PredictionChunk):
         try:
@@ -352,13 +387,25 @@ class AsyncDesktopClient(DesktopClient):
     def _model_gripper_max(self) -> float:
         return float(getattr(self, "GRIPPER_DATA_MAX", self.GRIPPER_PHYSICAL_MAX))
 
-    def _anchor_to_model_range(self, anchor: Optional[List[float]]):
+    def _anchor_to_model_range(
+        self,
+        anchor: Optional[List[float]],
+    ):
         if anchor is None:
             return None
+
         converted = list(anchor)
-        converted[-1] = (
-            converted[-1] / self.GRIPPER_PHYSICAL_MAX * self._model_gripper_max()
+
+        # Anchors come from _collect_sensor_data(), so their gripper
+        # component is already in the model/data feedback range.
+        converted[-1] = float(
+            np.clip(
+                float(converted[-1]),
+                0.0,
+                self._model_gripper_max(),
+            )
         )
+
         return converted
 
     @staticmethod
@@ -370,6 +417,9 @@ class AsyncDesktopClient(DesktopClient):
         return [list(action) for action in actions]
 
     def _preopen_unloaded_gripper(self, side: str, actions: list) -> bool:
+        # Disabled: preserve the model's original gripper timing.
+        return False
+
         if (
             self._last_gripper_command[side] != 0.0
             or self._gripper_closed_pose[side] is not None
@@ -387,6 +437,12 @@ class AsyncDesktopClient(DesktopClient):
 
         for action in actions[: first_open + 1]:
             action[-1] = self._model_gripper_max()
+
+        self._gripper_synthetic_preopen[side] = True
+        logger.info(
+            f"Gripper {side}: synthetic preopen "
+            f"from future open index={first_open}"
+        )
         return True
 
     def _prepare_action_chunk(
@@ -448,7 +504,13 @@ class AsyncDesktopClient(DesktopClient):
             ),
         )
         max_trim = max(0, action_count - reserve_steps)
-        return min(inference_steps, max_trim)
+        # A fresh prediction is not conditioned on the exact trajectory
+        # executed while inference was running. Trimming the full measured
+        # latency jumps directly into an unrelated future action prefix.
+        scaled_inference_steps = int(
+            np.floor(inference_steps * 0.25)
+        )
+        return min(scaled_inference_steps, max_trim)
 
     def _stitch_prediction(
         self,
@@ -457,6 +519,9 @@ class AsyncDesktopClient(DesktopClient):
         last_command: Optional[Tuple[list, list]],
         active_actions: List[Tuple[list, list]],
     ) -> List[Tuple[list, list]]:
+        raw_gripper_summary = self._format_raw_gripper_summary(
+            prediction.outputs
+        )
         prepared = self._prepare_action_chunk(
             prediction.outputs,
             prediction.left_anchor,
@@ -464,6 +529,8 @@ class AsyncDesktopClient(DesktopClient):
         )
         if not prepared:
             return []
+
+        pretrim_plan_summary = self._format_plan_summary(prepared)
 
         inference_steps = 0
         if prediction.request.control_step is not None:
@@ -552,6 +619,8 @@ class AsyncDesktopClient(DesktopClient):
             f"synthesized={max(0, overlap_steps - available_overlap)}, "
             f"rebased={str(rebased).lower()}, "
             f"world_lock={self.world_lock_steps}, "
+            f"raw_gripper={raw_gripper_summary}, "
+            f"pretrim_plan={pretrim_plan_summary}, "
             f"plan={plan_summary}, "
             f"handoff_error={handoff_error}, "
             f"buffered={min(len(left_actions), len(right_actions))}"
@@ -682,6 +751,60 @@ class AsyncDesktopClient(DesktopClient):
                 f"{side}:{float(np.max(displacement)):.3f}/"
                 f"{event_text}"
             )
+        return ",".join(summaries)
+
+    def _format_raw_gripper_summary(self, outputs: Dict) -> str:
+        """Summarize raw model gripper outputs before preopen/interpolation/trim."""
+        summaries = []
+        for side, key in (
+            ("left", "follow1_pos"),
+            ("right", "follow2_pos"),
+        ):
+            actions = self._normalize_actions(outputs.get(key))
+            if not actions:
+                summaries.append(f"{side}:missing")
+                continue
+
+            model_values = np.asarray(
+                [float(action[-1]) for action in actions],
+                dtype=float,
+            )
+            physical_values = np.asarray(
+                [
+                    self._gripper_to_physical_range(value)
+                    for value in model_values
+                ],
+                dtype=float,
+            )
+
+            close_indices = np.flatnonzero(
+                physical_values <= self.GRIPPER_CLOSE_THRESHOLD
+            )
+            open_indices = np.flatnonzero(
+                physical_values >= self.GRIPPER_OPEN_THRESHOLD
+            )
+
+            first_close = (
+                str(int(close_indices[0]))
+                if close_indices.size
+                else "-"
+            )
+            first_open = (
+                str(int(open_indices[0]))
+                if open_indices.size
+                else "-"
+            )
+
+            summaries.append(
+                f"{side}:n={len(model_values)},"
+                f"model={model_values.min():.3f}.."
+                f"{model_values.max():.3f},"
+                f"physical={physical_values.min():.2f}.."
+                f"{physical_values.max():.2f},"
+                f"close_i={first_close},"
+                f"open_i={first_open}"
+            )
+
         return ",".join(summaries)
 
     def _align_actions_to_world_reference(
@@ -820,9 +943,13 @@ class AsyncDesktopClient(DesktopClient):
                 return
 
             if position == 0.0:
+                synthetic_preopen = self._gripper_synthetic_preopen.get(
+                    side, False
+                )
                 open_pose = self._gripper_open_pose[side]
                 if (
-                    self.control_mode == "end_pose"
+                    not synthetic_preopen
+                    and self.control_mode == "end_pose"
                     and open_pose is not None
                     and arm_action is not None
                 ):
@@ -880,6 +1007,7 @@ class AsyncDesktopClient(DesktopClient):
                 and self.control_mode == "end_pose"
                 and arm_action is not None
             ):
+                self._gripper_synthetic_preopen[side] = False
                 self._gripper_closed_pose[side] = np.asarray(
                     arm_action[:3], dtype=float
                 )

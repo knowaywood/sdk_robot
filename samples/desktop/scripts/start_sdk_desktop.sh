@@ -32,4 +32,5 @@ PYTHONUNBUFFERED=1 python3 "$SCRIPT_DIR/start_sdk_desktop.py" \
     --control-mode "$CONTROL_MODE" \
     --interpolate-multiplier "$INTERPOLATE_MULTIPLIER" \
     --robot_sdk_url "$ROBOT_SDK_URL" \
+    "${@:7}" \
     --debug-step 2>&1 | tee "$LOG_FILE"
