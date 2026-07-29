@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
@@ -13,6 +14,48 @@ from x2robot_client.rtc_inference import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ActionBuffer:
+    """Thread-safe double buffer for async inference.
+
+    Inference thread writes completed chunks, execution thread
+    reads the latest available chunk without blocking each other.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._has_new = threading.Event()
+        self._front: Optional[Dict[str, Any]] = None
+        self._back: Optional[Dict[str, Any]] = None
+
+    def write(self, actions: Dict[str, Any]) -> None:
+        """Write a new action chunk (called by inference thread)."""
+        with self._lock:
+            self._back = actions
+            self._has_new.set()
+
+    def read(self) -> Optional[Dict[str, Any]]:
+        """Read the latest available chunk (called by execution thread).
+        Returns None if no new chunk since last read.
+        """
+        with self._lock:
+            if self._back is not None:
+                self._front = self._back
+                self._back = None
+                self._has_new.clear()
+            return self._front
+
+    def wait(self, timeout: float = 0.01) -> bool:
+        """Wait until a new chunk is available. Returns True if new data."""
+        return self._has_new.wait(timeout)
+
+    def clear(self) -> None:
+        """Drop both buffers (called on reset/stop)."""
+        with self._lock:
+            self._front = None
+            self._back = None
+            self._has_new.clear()
 
 
 class RobotClientBase(ABC):
@@ -30,6 +73,7 @@ class RobotClientBase(ABC):
         rtc_delay_steps: int = 0,
         rtc_overlap_steps: int = 3,
         rtc_blend: bool = False,
+        async_mode: bool = False,
     ):
         self.model_address = model_address
         self.model_port = model_port
@@ -41,6 +85,7 @@ class RobotClientBase(ABC):
         self.rtc_delay_steps = rtc_delay_steps
         self.rtc_overlap_steps = rtc_overlap_steps
         self.rtc_blend = rtc_blend
+        self.async_mode = async_mode
 
         if not self.ip_address(model_address):
             try:
@@ -55,6 +100,8 @@ class RobotClientBase(ABC):
         self.remote_control = False
         self.client: Optional[RobotClient] = None
         self.prev_outputs: Optional[Dict[str, Any]] = None
+        self._action_buffer = ActionBuffer()
+        self._inference_thread: Optional[threading.Thread] = None
 
         # Initialize components
         self._init_inference_client()
@@ -117,62 +164,89 @@ class RobotClientBase(ABC):
         pass
 
     def execute_model(self) -> None:
-        """Main execution loop."""
-        logger.info("Starting model execution loop...")
+        """Main execution loop.
+
+        In sync mode (default): collect → infer → execute (blocking).
+        In async mode:       inference runs in a background thread,
+                             execution thread picks up the latest chunk.
+        """
+        if self.async_mode:
+            self._execute_model_async()
+        else:
+            self._execute_model_sync()
+
+    def _execute_model_sync(self) -> None:
+        """Synchronous execution loop (original behavior)."""
+        logger.info("Starting sync execution loop...")
         try:
             while not self.action_terminator:
                 if self.remote_control:
                     time.sleep(0.1)
-                else:
-                    # 1. Collect sensor data
-                    st_time_1 = time.time()
-                    sensor_data = self._collect_sensor_data()
-                    ed_time_1 = time.time()
+                    continue
 
-                    # 2. Inference
-                    st_time_2 = time.time()
-                    outputs = self._inference_with_retry(sensor_data)
-                    ed_time_2 = time.time()
+                st_data = time.time()
+                sensor_data = self._collect_sensor_data()
+                t_data = time.time() - st_data
 
-                    # 3. Decode msgpack-numpy arrays before any processing
-                    raw_decoded = decode_outputs(outputs)
-                    if self.rtc_enabled:
-                        # Server-side RTC: server already did three-zone blending
-                        # Client only needs gripper protection
-                        outputs = restore_gripper_in_outputs(raw_decoded, raw_decoded)
-                    elif self.rtc_blend:
-                        # Client-side three-zone RTC blending
-                        outputs = rtc_blend_outputs(
-                            self.prev_outputs, raw_decoded,
-                            self.rtc_delay_steps, self.rtc_overlap_steps,
-                        )
-                        outputs = restore_gripper_in_outputs(outputs, raw_decoded)
-                    elif self.smooth_chunks:
-                        # Cosine-decay boundary blending (original mode)
-                        outputs = smooth_chunk_boundary(
-                            self.prev_outputs, raw_decoded, self.blend_steps
-                        )
-                        outputs = restore_gripper_in_outputs(outputs, raw_decoded)
-                    else:
-                        outputs = raw_decoded
-                    self.prev_outputs = outputs
+                st_infer = time.time()
+                outputs = self._inference_with_retry(sensor_data)
+                t_infer = time.time() - st_infer
 
-                    # 4. Execute actions
-                    st_time_3 = time.time()
-                    self._execute_actions(outputs)
-                    ed_time_3 = time.time()
+                raw_decoded = decode_outputs(outputs)
+                blended = self._blend_outputs(raw_decoded)
 
-                    logger.info(
-                        f"Data: {ed_time_1 - st_time_1:.4f}s, "
-                        f"Infer: {ed_time_2 - st_time_2:.4f}s, "
-                        f"Exec: {ed_time_3 - st_time_3:.4f}s"
-                    )
+                st_exec = time.time()
+                self._execute_actions(blended)
+                t_exec = time.time() - st_exec
+
+                logger.info(
+                    f"Data: {t_data:.4f}s, Infer: {t_infer:.4f}s, Exec: {t_exec:.4f}s"
+                )
 
         except KeyboardInterrupt:
             logger.info("Received Ctrl+C, stopping...")
             self.safe_stop()
         except Exception as e:
             logger.error(f"Exception in execution loop: {e}")
+            self.safe_stop()
+            raise
+
+    def _execute_model_async(self) -> None:
+        """Asynchronous execution loop with background inference thread."""
+        logger.info("Starting async execution loop...")
+        self._action_buffer.clear()
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop, daemon=True,
+            name="async-inference",
+        )
+        self._inference_thread.start()
+
+        try:
+            while not self.action_terminator:
+                if self.remote_control:
+                    time.sleep(0.1)
+                    continue
+
+                # Wait for first chunk or check for new data
+                chunk = self._action_buffer.read()
+                if chunk is None:
+                    if not self._action_buffer.wait(timeout=0.5):
+                        continue
+                    chunk = self._action_buffer.read()
+                    if chunk is None:
+                        continue
+
+                st_exec = time.time()
+                self._execute_actions(chunk)
+                t_exec = time.time() - st_exec
+
+                logger.debug(f"Async exec: {t_exec:.4f}s")
+
+        except KeyboardInterrupt:
+            logger.info("Received Ctrl+C, stopping...")
+            self.safe_stop()
+        except Exception as e:
+            logger.error(f"Exception in async execution loop: {e}")
             self.safe_stop()
             raise
 
@@ -188,6 +262,44 @@ class RobotClientBase(ABC):
                 if attempt < self.max_retries - 1:
                     time.sleep(0.1)
         raise RuntimeError(f"Model inference failed after {self.max_retries} attempts")
+
+    def _blend_outputs(self, raw_decoded: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply configured blending strategy to raw model outputs."""
+        if self.rtc_enabled:
+            out = restore_gripper_in_outputs(raw_decoded, raw_decoded)
+        elif self.rtc_blend:
+            out = rtc_blend_outputs(
+                self.prev_outputs, raw_decoded,
+                self.rtc_delay_steps, self.rtc_overlap_steps,
+            )
+            out = restore_gripper_in_outputs(out, raw_decoded)
+        elif self.smooth_chunks:
+            out = smooth_chunk_boundary(
+                self.prev_outputs, raw_decoded, self.blend_steps
+            )
+            out = restore_gripper_in_outputs(out, raw_decoded)
+        else:
+            out = raw_decoded
+        self.prev_outputs = out
+        return out
+
+    def _inference_loop(self) -> None:
+        """Background inference thread for async mode.
+        Continuously collects sensor data, runs inference, blends,
+        and writes to the action buffer.
+        """
+        logger.info("Async inference thread started")
+        try:
+            while not self.action_terminator:
+                sensor_data = self._collect_sensor_data()
+                outputs = self._inference_with_retry(sensor_data)
+                raw_decoded = decode_outputs(outputs)
+                blended = self._blend_outputs(raw_decoded)
+                self._action_buffer.write(blended)
+        except Exception as e:
+            logger.error(f"Inference thread exception: {e}")
+        finally:
+            logger.info("Async inference thread stopped")
 
     def start_control(self) -> None:
         """Start control loop (enable model execution)."""
@@ -209,6 +321,9 @@ class RobotClientBase(ABC):
         """Perform a safe stop procedure (sets action_terminator)."""
         logger.info("Executing safe stop...")
         self.action_terminator = True
+        if self._inference_thread is not None and self._inference_thread.is_alive():
+            self._inference_thread.join(timeout=5)
+            logger.info("Inference thread joined")
 
     def __del__(self) -> None:
         self.safe_stop()

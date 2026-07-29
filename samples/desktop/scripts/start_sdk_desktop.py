@@ -21,6 +21,7 @@ def main(args):
         rtc_delay_steps=max(0, args.rtc_delay_ms // 33),
         rtc_overlap_steps=args.rtc_overlap_steps,
         rtc_blend=args.rtc_blend,
+        async_mode=args.async_mode,
     )
 
     try:
@@ -31,7 +32,7 @@ def main(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Start EX001 Dual Arm Robot Client")
+    parser = argparse.ArgumentParser(description="Start Desktop Robot Client")
 
     parser.add_argument(
         "--model-address", default="localhost", type=str, help="Model server IP address"
@@ -119,6 +120,13 @@ def parse_args():
         "--rtc-blend",
         action="store_true",
         help="Enable client-side three-zone RTC blending",
+    )
+
+    parser.add_argument(
+        "--async-mode",
+        action="store_true",
+        help="Enable async pipeline: inference runs in background thread, "
+             "execution picks up latest chunk without blocking",
     )
 
     return parser.parse_args()
