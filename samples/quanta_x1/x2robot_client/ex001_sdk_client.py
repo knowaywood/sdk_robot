@@ -115,6 +115,10 @@ class EX001SDKClient(RobotClientBase):
         save_debug_plot: bool = False,
         smooth_chunks: bool = False,
         blend_steps: int = 3,
+        rtc_enabled: bool = False,
+        rtc_delay_steps: int = 0,
+        rtc_overlap_steps: int = 3,
+        rtc_blend: bool = False,
     ):
         self.control_mode = control_mode
         self.camera_history_k = camera_history_k
@@ -139,7 +143,11 @@ class EX001SDKClient(RobotClientBase):
             logger.info(
                 f"[DEBUG PLOT] Saving action_chunk plots to: {self.plot_dir} (cwd when started: {cwd})"
             )
-        super().__init__(model_address, model_port, instruction, max_retries, smooth_chunks, blend_steps)
+        super().__init__(
+            model_address, model_port, instruction, max_retries,
+            smooth_chunks, blend_steps,
+            rtc_enabled, rtc_delay_steps, rtc_overlap_steps, rtc_blend,
+        )
 
     def _init_robot_controller(self):
         """Initialize robot controller using robocontrol."""

@@ -14,6 +14,10 @@ INTERPOLATE_MULTIPLIER=${5:-20}
 ROBOT_SDK_URL=${6:-"192.168.10.1:50051"}
 SMOOTH_CHUNKS=${7:-""}
 BLEND_STEPS=${8:-3}
+RTC_ENABLED=${9:-""}
+RTC_DELAY_MS=${10:-100}
+RTC_OVERLAP_STEPS=${11:-3}
+RTC_BLEND=${12:-""}
 
 echo "Starting EX001 Robot Client..."
 echo "Model: $MODEL_ADDRESS:$MODEL_PORT"
@@ -21,8 +25,14 @@ echo "Instruction: $INSTRUCTION"
 echo "Control Mode: $CONTROL_MODE"
 echo "Smooth Chunks: $SMOOTH_CHUNKS"
 echo "Blend Steps: $BLEND_STEPS"
+echo "RTC Enabled: $RTC_ENABLED"
+echo "RTC Delay MS: $RTC_DELAY_MS"
+echo "RTC Overlap Steps: $RTC_OVERLAP_STEPS"
+echo "RTC Blend: $RTC_BLEND"
 
 [ -n "$SMOOTH_CHUNKS" ] && SMOOTH_CHUNKS_FLAG="--smooth-chunks" || SMOOTH_CHUNKS_FLAG=""
+[ -n "$RTC_ENABLED" ] && RTC_FLAG="--rtc-enabled" || RTC_FLAG=""
+[ -n "$RTC_BLEND" ] && RTC_BLEND_FLAG="--rtc-blend" || RTC_BLEND_FLAG=""
 
 python3 "$SCRIPT_DIR/start_sdk_ex001.py" \
     --model-address "$MODEL_ADDRESS" \
@@ -33,4 +43,8 @@ python3 "$SCRIPT_DIR/start_sdk_ex001.py" \
     --robot_sdk_url "$ROBOT_SDK_URL" \
     --debug-step \
     $SMOOTH_CHUNKS_FLAG \
-    --blend-steps "$BLEND_STEPS"
+    --blend-steps "$BLEND_STEPS" \
+    $RTC_FLAG \
+    --rtc-delay-ms "$RTC_DELAY_MS" \
+    --rtc-overlap-steps "$RTC_OVERLAP_STEPS" \
+    $RTC_BLEND_FLAG

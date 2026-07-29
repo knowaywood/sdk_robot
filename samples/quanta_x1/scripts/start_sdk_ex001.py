@@ -18,6 +18,10 @@ def main(args):
         robot_sdk_url=args.robot_sdk_url,
         smooth_chunks=args.smooth_chunks,
         blend_steps=args.blend_steps,
+        rtc_enabled=args.rtc_enabled,
+        rtc_delay_steps=max(0, args.rtc_delay_ms // 33),
+        rtc_overlap_steps=args.rtc_overlap_steps,
+        rtc_blend=args.rtc_blend,
     )
 
     try:
@@ -96,6 +100,32 @@ def parse_args():
         type=int,
         default=3,
         help="Number of initial steps to blend when smooth-chunks is enabled",
+    )
+
+    parser.add_argument(
+        "--rtc-enabled",
+        action="store_true",
+        help="Enable server-side RTC (three-zone denoising blending on server)",
+    )
+
+    parser.add_argument(
+        "--rtc-delay-ms",
+        type=int,
+        default=100,
+        help="RTC delay in milliseconds (D=0/100/200)",
+    )
+
+    parser.add_argument(
+        "--rtc-overlap-steps",
+        type=int,
+        default=3,
+        help="Number of overlap steps for RTC blending (M)",
+    )
+
+    parser.add_argument(
+        "--rtc-blend",
+        action="store_true",
+        help="Enable client-side three-zone RTC blending",
     )
 
     return parser.parse_args()

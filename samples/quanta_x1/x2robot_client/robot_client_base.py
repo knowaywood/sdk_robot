@@ -9,6 +9,7 @@ from x2robot_client.rtc_inference import (
     decode_outputs,
     restore_gripper_in_outputs,
     smooth_chunk_boundary,
+    rtc_blend_outputs,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,10 @@ class RobotClientBase(ABC):
         max_retries: int = 3,
         smooth_chunks: bool = False,
         blend_steps: int = 3,
+        rtc_enabled: bool = False,
+        rtc_delay_steps: int = 0,
+        rtc_overlap_steps: int = 3,
+        rtc_blend: bool = False,
     ):
         self.model_address = model_address
         self.model_port = model_port
@@ -32,6 +37,10 @@ class RobotClientBase(ABC):
         self.max_retries = max_retries
         self.smooth_chunks = smooth_chunks
         self.blend_steps = blend_steps
+        self.rtc_enabled = rtc_enabled
+        self.rtc_delay_steps = rtc_delay_steps
+        self.rtc_overlap_steps = rtc_overlap_steps
+        self.rtc_blend = rtc_blend
 
         if not self.ip_address(model_address):
             try:
@@ -127,7 +136,19 @@ class RobotClientBase(ABC):
 
                     # 3. Decode msgpack-numpy arrays before any processing
                     raw_decoded = decode_outputs(outputs)
-                    if self.smooth_chunks:
+                    if self.rtc_enabled:
+                        # Server-side RTC: server already did three-zone blending
+                        # Client only needs gripper protection
+                        outputs = restore_gripper_in_outputs(raw_decoded, raw_decoded)
+                    elif self.rtc_blend:
+                        # Client-side three-zone RTC blending
+                        outputs = rtc_blend_outputs(
+                            self.prev_outputs, raw_decoded,
+                            self.rtc_delay_steps, self.rtc_overlap_steps,
+                        )
+                        outputs = restore_gripper_in_outputs(outputs, raw_decoded)
+                    elif self.smooth_chunks:
+                        # Cosine-decay boundary blending (original mode)
                         outputs = smooth_chunk_boundary(
                             self.prev_outputs, raw_decoded, self.blend_steps
                         )

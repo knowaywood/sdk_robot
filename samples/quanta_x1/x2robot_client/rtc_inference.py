@@ -147,6 +147,52 @@ def _smooth_new_chunk(
     return out
 
 
+def rtc_blend_outputs(
+    prev_outputs: Dict[str, np.ndarray],
+    new_outputs: Dict[str, np.ndarray],
+    delay_steps: int,
+    overlap_steps: int,
+) -> Dict[str, np.ndarray]:
+    """Three-zone RTC blending for dict-level outputs (upgraded from single-
+    array compute_rtc_blend).  Freeze/Overlap/Free zones per key.
+
+    Args:
+        prev_outputs: Previous inference output dict.
+        new_outputs:  Current inference output dict.
+        delay_steps:  D — freeze zone width (steps already executed).
+        overlap_steps:  M — overlap zone width.
+
+    Returns:
+        Blended output dict.
+    """
+    if prev_outputs is None:
+        return new_outputs
+
+    blended = {}
+    for key in new_outputs:
+        new_arr = new_outputs[key]
+        if new_arr is None or isinstance(new_arr, dict):
+            blended[key] = new_arr
+            continue
+        new_arr = np.asarray(new_arr, dtype=np.float64)
+        if new_arr.ndim != 2 or new_arr.shape[0] < 1:
+            blended[key] = new_arr
+            continue
+
+        prev_arr = prev_outputs.get(key)
+        if prev_arr is None or isinstance(prev_arr, dict):
+            blended[key] = new_arr
+            continue
+        prev_arr = np.asarray(prev_arr, dtype=np.float64)
+        if prev_arr.ndim != 2 or prev_arr.shape[0] < 1:
+            blended[key] = new_arr
+            continue
+
+        blended[key] = compute_rtc_blend(prev_arr, new_arr, delay_steps, overlap_steps)
+
+    return blended
+
+
 def compute_rtc_blend(
     prev_chunk: np.ndarray,
     new_chunk: np.ndarray,
